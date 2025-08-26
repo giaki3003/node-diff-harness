@@ -1,0 +1,32 @@
+[package]
+name = "replay"
+version = "0.1.0"
+edition = "2021"
+description = "Replay tool for debugging differential fuzzing traces"
+
+[[bin]]
+name = "replay"
+path = "src/main.rs"
+
+[dependencies]
+# Local dependencies
+proto = { path = "../proto" }
+rust-step = { path = "../adapters/rust-step" }
+
+# Command line interface
+clap = { version = "4.4", features = ["derive"] }
+
+# Common dependencies
+anyhow.workspace = true
+tokio = { workspace = true, features = ["rt", "process"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json = "1.0"
+
+# For output formatting
+colored = "2.0"
+tabled = "0.15"
+
+# For file I/O
+hex = "0.4"
+sha2.workspace = true

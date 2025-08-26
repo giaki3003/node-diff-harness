@@ -1,0 +1,45 @@
+defmodule ElixirRunner.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :elixir_runner,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      start_permanent: Mix.env() == :prod,
+      deps: deps(),
+      escript: escript_config()
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger, :crypto]
+    ]
+  end
+
+  defp deps do
+    [
+      # Elixir node implementation
+      {:ama, path: "../../node/ex"},
+      
+      # JSON for trace parsing
+      {:jason, "~> 1.4"},
+      
+      # Note: ETF serialization uses built-in :erlang.term_to_binary
+      # Note: Using SHA256 for deterministic hashing (built-in :crypto module)
+      
+      # Development dependencies
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.3", only: [:dev], runtime: false}
+    ]
+  end
+
+  defp escript_config do
+    [
+      main_module: ElixirRunner.CLI,
+      name: "elixir_runner",
+      embed_elixir: true
+    ]
+  end
+end

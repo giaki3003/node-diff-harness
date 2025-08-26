@@ -1,0 +1,40 @@
+[package]
+name = "fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys.workspace = true
+arbitrary.workspace = true
+
+# Local dependencies
+proto = { path = "../proto" }
+rust-step = { path = "../adapters/rust-step" }
+
+# Common dependencies
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+nix.workspace = true
+
+# For subprocess communication
+serde_json = "1.0"
+hex = "0.4"
+blake3.workspace = true
+
+[[bin]]
+name = "fuzz_protocol"
+path = "fuzz_targets/fuzz_protocol.rs"
+test = false
+doc = false
+
+[features]
+default = []
+
+[profile.release]
+debug = 1

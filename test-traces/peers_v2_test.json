@@ -1,0 +1,10 @@
+{
+  "seed": 12345,
+  "ops": [
+    {
+      "PeersV2": {
+        "anrs": ["test.peer"]
+      }
+    }
+  ]
+}

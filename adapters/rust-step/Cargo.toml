@@ -1,0 +1,29 @@
+[package]
+name = "rust-step"
+version = "0.1.0"
+edition = "2021"
+description = "Rust adapter for executing traces on the rs_node implementation"
+
+[dependencies]
+# Local dependencies
+proto = { path = "../../proto" }
+
+# Rust node implementation (via path dependency to submodule)
+ama_core = { path = "../../rs_node/core" }
+
+# Workspace dependencies
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+sha2.workspace = true
+
+# For ETF/Erlang term format (used by rs_node)
+eetf = "0.10"
+
+# For deterministic execution
+rand = "0.8"
+rand_chacha = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"

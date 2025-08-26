@@ -1,0 +1,6 @@
+[submodule "rs_node"]
+	path = rs_node
+	url = https://github.com/valentynfaychuk/rs_node
+[submodule "node"]
+	path = node
+	url = https://github.com/amadeus-robot/node

@@ -1,0 +1,30 @@
+[package]
+name = "proto"
+version = "0.1.0"
+edition = "2021"
+description = "Protocol definitions and trace formats for Amadeus node differential fuzzing"
+
+[lib]
+name = "proto"
+path = "src/lib.rs"
+
+[dependencies]
+# Serialization
+serde = { workspace = true }
+bincode.workspace = true
+
+# For fuzzing support
+arbitrary = { workspace = true }
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+# For testing
+tokio = { workspace = true }
+
+[features]
+default = []
+# Enable when using with libfuzzer targets
+fuzzing = []

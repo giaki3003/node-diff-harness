@@ -1,0 +1,14 @@
+{
+  "seed": 12345,
+  "ops": [
+    {
+      "Ping": {
+        "temporal_height": 100,
+        "temporal_slot": 50,
+        "rooted_height": 90,
+        "rooted_slot": 45,
+        "timestamp_ms": 1700000000000
+      }
+    }
+  ]
+}
