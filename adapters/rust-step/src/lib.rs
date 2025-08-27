@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_different_seeds() {
+    async fn test_different_seeds_same_digest() {
         let trace = Trace::basic_protocol_test();
 
         let mut executor1 = RustStepExecutor::with_seed(12345).unwrap();
@@ -268,7 +268,10 @@ mod tests {
         let mut executor2 = RustStepExecutor::with_seed(67890).unwrap();
         let result2 = executor2.execute_trace(&trace).unwrap();
 
-        // Results should be different with different seeds
-        assert_ne!(result1.digest, result2.digest);
+        // With canonical digests, same trace should produce same digest regardless of seed
+        // This is correct behavior for differential fuzzing
+        assert_eq!(result1.digest, result2.digest);
+        assert_eq!(result1.ops_executed, result2.ops_executed);
+        assert!(result1.is_success() && result2.is_success());
     }
 }
