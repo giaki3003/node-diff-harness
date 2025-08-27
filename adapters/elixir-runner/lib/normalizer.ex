@@ -28,7 +28,13 @@ defmodule ElixirRunner.Normalizer do
           # Match Rust format: "protocol:" + messages_count + canonical_digest
           # Ensure data is treated as pure binary, not UTF-8 string
           messages_count = Map.get(result, :messages_count, 1)
-          binary_data = if is_binary(data), do: data, else: <<data::binary>>
+          
+          # Ensure data is treated as raw binary, avoiding UTF-8 encoding  
+          binary_data = case data do
+            data when is_binary(data) -> data
+            _ -> :crypto.hash(:sha256, :erlang.term_to_binary(data))
+          end
+          
           hash_state
           |> :crypto.hash_update(<<112, 114, 111, 116, 111, 99, 111, 108, 58>>)  # "protocol:" as explicit bytes
           |> :crypto.hash_update(<<messages_count::32-little>>)

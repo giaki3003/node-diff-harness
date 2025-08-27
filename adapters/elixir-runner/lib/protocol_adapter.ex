@@ -153,7 +153,7 @@ defmodule ElixirRunner.ProtocolAdapter do
   # Create canonical digest for Ping message (matching Rust format)
   defp create_ping_canonical_digest(temporal_height, temporal_slot, rooted_height, rooted_slot, timestamp_ms) do
     # Use incremental hashing exactly like Rust implementation
-    :crypto.hash_init(:sha256)
+    digest = :crypto.hash_init(:sha256)
     |> :crypto.hash_update(@protocol_ping)
     |> :crypto.hash_update(<<rooted_height::64-little>>)
     |> :crypto.hash_update(<<rooted_slot::64-little>>)
@@ -161,6 +161,8 @@ defmodule ElixirRunner.ProtocolAdapter do
     |> :crypto.hash_update(<<temporal_slot::64-little>>)
     |> :crypto.hash_update(<<timestamp_ms::64-little>>)
     |> :crypto.hash_final()
+    
+    digest
   end
   
   # Create canonical digest for TxPool message (matching Rust format)  
