@@ -60,15 +60,29 @@ defmodule ElixirRunner.Normalizer do
   Serialize execution result for transmission back to fuzzer.
   """
   def serialize_result(result) do
-    # Send result in simple binary format for easy parsing:
-    # [ops_executed: 4 bytes big-endian] + [digest: 32 bytes SHA256]
+    # Send result in extended binary format for easy parsing:
+    # [ops_executed: 4 bytes big-endian] + [digest: 32 bytes SHA256] + 
+    # [duration_us: 8 bytes big-endian] + [messages_processed: 4 bytes big-endian] +
+    # [transactions_processed: 4 bytes big-endian]
+    # Total: 52 bytes (was 36 bytes)
+    
     ops_executed = Map.get(result, :ops_executed, 0)
     digest = Map.get(result, :digest, :crypto.strong_rand_bytes(32))
     
     # Ensure digest is exactly 32 bytes (SHA256)
     digest_bytes = if byte_size(digest) == 32, do: digest, else: :crypto.hash(:sha256, digest)
     
-    <<ops_executed::32-unsigned-big, digest_bytes::binary>>
+    # Extract metrics
+    metrics = Map.get(result, :metrics, %{})
+    duration_us = Map.get(metrics, :duration_us, 0)
+    messages_processed = Map.get(metrics, :messages_processed, 0)
+    transactions_processed = Map.get(metrics, :transactions_processed, 0)
+    
+    <<ops_executed::32-unsigned-big, 
+      digest_bytes::binary,
+      duration_us::64-unsigned-big,
+      messages_processed::32-unsigned-big,
+      transactions_processed::32-unsigned-big>>
   end
 
   # Normalize a single operation result for consistent hashing

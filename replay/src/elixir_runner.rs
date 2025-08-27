@@ -88,8 +88,10 @@ impl ElixirRunner {
             ));
         }
 
-        // Parse the simple binary format from Elixir:
-        // [ops_executed: 4 bytes big-endian] + [digest: 32 bytes SHA256]
+        // Parse binary format from Elixir oracle with backwards compatibility:
+        // Legacy (36 bytes): [ops_executed: 4 bytes] + [digest: 32 bytes]
+        // Extended (52 bytes): [ops_executed: 4 bytes] + [digest: 32 bytes] + 
+        //                     [duration_us: 8 bytes] + [messages: 4 bytes] + [txs: 4 bytes]
         if response.len() < 36 {
             return Ok(ExecutionResult::error(
                 format!(
@@ -117,7 +119,35 @@ impl ElixirRunner {
             ));
         }
 
-        Ok(ExecutionResult::success(digest, ops_executed))
+        let mut result = ExecutionResult::success(digest, ops_executed);
+
+        // Check if extended format with metrics (52 bytes total)
+        if response.len() >= 52 {
+            // Extract additional metrics
+            let duration_us = u64::from_be_bytes([
+                response[36], response[37], response[38], response[39],
+                response[40], response[41], response[42], response[43]
+            ]);
+
+            let messages_processed = u32::from_be_bytes([
+                response[44], response[45], response[46], response[47]
+            ]);
+
+            let transactions_processed = u32::from_be_bytes([
+                response[48], response[49], response[50], response[51]
+            ]);
+
+            let metrics = proto::ExecutionMetrics {
+                duration_us,
+                memory_bytes: None,
+                messages_processed,
+                transactions_processed,
+            };
+
+            result = result.with_metrics(metrics);
+        }
+
+        Ok(result)
     }
 
     async fn spawn_elixir_process() -> Result<Child> {

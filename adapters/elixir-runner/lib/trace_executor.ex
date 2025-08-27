@@ -56,7 +56,19 @@ defmodule ElixirRunner.TraceExecutor do
       
       updated_executor = %{executor | seed: trace.seed}
       
-      execute_operations(updated_executor, trace.ops, [])
+      # Time the execution
+      {duration_us, result} = :timer.tc(fn ->
+        execute_operations(updated_executor, trace.ops, [])
+      end)
+      
+      # Add timing to result
+      case result do
+        {:ok, result_map} ->
+          updated_metrics = %{result_map.metrics | duration_us: duration_us}
+          {:ok, %{result_map | metrics: updated_metrics}}
+        error ->
+          error
+      end
     rescue
       e -> {:error, "execute_exception: #{Exception.message(e)}"}
     catch

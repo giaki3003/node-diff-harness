@@ -98,9 +98,10 @@ impl ElixirOracle {
     }
 
     fn parse_elixir_response(&self, response_data: &[u8]) -> Result<ExecutionResult> {
-        // Parse the simple binary format from Elixir oracle:
-        // [ops_executed: 4 bytes big-endian] + [digest: 32 bytes SHA256]
-        // This matches the format used by the replay tool
+        // Parse binary format from Elixir oracle with backwards compatibility:
+        // Legacy (36 bytes): [ops_executed: 4 bytes] + [digest: 32 bytes]
+        // Extended (52 bytes): [ops_executed: 4 bytes] + [digest: 32 bytes] + 
+        //                     [duration_us: 8 bytes] + [messages: 4 bytes] + [txs: 4 bytes]
         
         if response_data.len() < 36 {
             return Ok(ExecutionResult::error(
@@ -133,7 +134,35 @@ impl ElixirOracle {
             ));
         }
 
-        Ok(ExecutionResult::success(digest, ops_executed))
+        let mut result = ExecutionResult::success(digest, ops_executed);
+
+        // Check if extended format with metrics (52 bytes total)
+        if response_data.len() >= 52 {
+            // Extract additional metrics
+            let duration_us = u64::from_be_bytes([
+                response_data[36], response_data[37], response_data[38], response_data[39],
+                response_data[40], response_data[41], response_data[42], response_data[43]
+            ]);
+
+            let messages_processed = u32::from_be_bytes([
+                response_data[44], response_data[45], response_data[46], response_data[47]
+            ]);
+
+            let transactions_processed = u32::from_be_bytes([
+                response_data[48], response_data[49], response_data[50], response_data[51]
+            ]);
+
+            let metrics = proto::ExecutionMetrics {
+                duration_us,
+                memory_bytes: None,
+                messages_processed,
+                transactions_processed,
+            };
+
+            result = result.with_metrics(metrics);
+        }
+
+        Ok(result)
     }
 
 
