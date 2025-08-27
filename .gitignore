@@ -3,3 +3,4 @@ deps/
 elixir_runner
 target
 fuzz_protocol
+.repo-to-text-settings.yaml

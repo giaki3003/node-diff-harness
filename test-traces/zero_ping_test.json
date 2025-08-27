@@ -1,0 +1,14 @@
+{
+  "seed": 0,
+  "ops": [
+    {
+      "Ping": {
+        "temporal_height": 0,
+        "temporal_slot": 0,
+        "rooted_height": 0,
+        "rooted_slot": 0,
+        "timestamp_ms": 0
+      }
+    }
+  ]
+}

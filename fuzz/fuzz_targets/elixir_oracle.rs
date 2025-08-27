@@ -93,41 +93,49 @@ impl ElixirOracle {
             .read_exact(&mut response_buf)
             .context("Failed to read response data")?;
 
-        // Parse response (Erlang term format)
+        // Parse response (simple binary format)
         self.parse_elixir_response(&response_buf)
     }
 
     fn parse_elixir_response(&self, response_data: &[u8]) -> Result<ExecutionResult> {
-        // For now, just create a minimal response
-        // In production, we'd properly deserialize the Erlang term format
-
-        // Try to deserialize as Erlang term
-        match self.try_parse_etf(response_data) {
-            Ok(result) => Ok(result),
-            Err(_) => {
-                // Fallback: create digest from raw response
-                let digest = blake3::hash(response_data).as_bytes().to_vec();
-                Ok(ExecutionResult::success(digest, 1))
-            }
+        // Parse the simple binary format from Elixir oracle:
+        // [ops_executed: 4 bytes big-endian] + [digest: 32 bytes SHA256]
+        // This matches the format used by the replay tool
+        
+        if response_data.len() < 36 {
+            return Ok(ExecutionResult::error(
+                format!(
+                    "Invalid response format: expected at least 36 bytes, got {}",
+                    response_data.len()
+                ),
+                0,
+            ));
         }
+
+        // Extract ops_executed (first 4 bytes, big-endian) 
+        let ops_executed = u32::from_be_bytes([
+            response_data[0],
+            response_data[1], 
+            response_data[2],
+            response_data[3]
+        ]) as usize;
+
+        // Extract digest (next 32 bytes)
+        let digest = response_data[4..36].to_vec();
+
+        if digest.len() != 32 {
+            return Ok(ExecutionResult::error(
+                format!(
+                    "Invalid digest length: expected 32 bytes, got {}",
+                    digest.len()
+                ),
+                ops_executed,
+            ));
+        }
+
+        Ok(ExecutionResult::success(digest, ops_executed))
     }
 
-    fn try_parse_etf(&self, data: &[u8]) -> Result<ExecutionResult> {
-        // This is a simplified parser - in production we'd use a proper ETF library
-        // or implement bincode deserialization in Elixir
-
-        // For now, just hash the data to create a consistent digest
-        let digest = blake3::hash(data).as_bytes().to_vec();
-
-        // Try to extract basic info (this is very naive parsing)
-        let ops_executed = if data.len() > 8 {
-            u32::from_be_bytes([data[4], data[5], data[6], data[7]]) % 100
-        } else {
-            1
-        };
-
-        Ok(ExecutionResult::success(digest, ops_executed as usize))
-    }
 
     fn restart(&mut self) -> Result<()> {
         // Kill old process
