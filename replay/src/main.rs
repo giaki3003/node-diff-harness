@@ -4,6 +4,7 @@
 //! showing the differences between them for debugging purposes.
 
 use anyhow::{Context, Result};
+use arbitrary::{Arbitrary, Unstructured};
 use clap::{Arg, Command};
 use colored::*;
 use proto::{ExecutionResult, Trace, TraceExecutor};
@@ -47,7 +48,7 @@ async fn main() -> Result<()> {
                 .short('f')
                 .long("format")
                 .value_name("FORMAT")
-                .help("Input format (auto, json, bincode)")
+                .help("Input format (auto, json, bincode, libfuzzer)")
                 .default_value("auto"),
         )
         .arg(
@@ -159,11 +160,13 @@ fn load_trace_file(path: &str, format: &str) -> Result<Trace> {
     match format {
         "json" => load_json_trace(&data),
         "bincode" => load_bincode_trace(&data),
+        "libfuzzer" => load_libfuzzer_trace(&data),
         "auto" => {
-            // Try bincode first, then JSON
-            load_bincode_trace(&data)
+            // Try libfuzzer first (most common from fuzzer), then JSON, then bincode
+            load_libfuzzer_trace(&data)
                 .or_else(|_| load_json_trace(&data))
-                .context("Could not parse trace as bincode or JSON")
+                .or_else(|_| load_bincode_trace(&data))
+                .context("Could not parse trace as libfuzzer, JSON, or bincode")
         }
         _ => anyhow::bail!("Unsupported format: {}", format),
     }
@@ -177,6 +180,11 @@ fn load_json_trace(data: &[u8]) -> Result<Trace> {
 
 fn load_bincode_trace(data: &[u8]) -> Result<Trace> {
     Trace::from_bytes(data).context("Failed to parse bincode trace")
+}
+
+fn load_libfuzzer_trace(data: &[u8]) -> Result<Trace> {
+    let mut unstructured = Unstructured::new(data);
+    Trace::arbitrary(&mut unstructured).context("Failed to parse libfuzzer trace")
 }
 
 fn execute_rust(trace: &Trace) -> Result<ExecutionResult> {

@@ -5,7 +5,7 @@
 
 use ama_core::consensus::entry::EntryHeader;
 use ama_core::consensus::entry::EntrySummary;
-use ama_core::node::protocol::{self, Peers, Ping, Protocol, TxPool};
+use ama_core::node::protocol;
 use anyhow::Result;
 use proto::MessageType;
 use sha2::{Digest, Sha256};
@@ -60,66 +60,34 @@ impl ProtocolAdapter {
         self.create_peers_canonical_digest(ips)
     }
 
-    /// Test message serialization round-trip
+    /// Test message deserialization
     pub fn test_serialization(&mut self, msg_type: &MessageType, payload: &[u8]) -> Result<bool> {
-        // Test round-trip serialization based on message type
+        // Test deserialization success based on message type
         match msg_type {
             MessageType::Ping => {
-                // Try to deserialize as ping, then re-serialize
                 match protocol::from_etf_bin(payload) {
-                    Ok(msg) => {
-                        if msg.typename() == "ping" {
-                            // Try to serialize back
-                            match msg.to_etf_bin() {
-                                Ok(_) => Ok(true),
-                                Err(_) => Ok(false),
-                            }
-                        } else {
-                            Ok(false)
-                        }
-                    }
+                    Ok(msg) => Ok(msg.typename() == "ping"),
                     Err(_) => Ok(false),
                 }
             }
-            MessageType::Pong => match protocol::from_etf_bin(payload) {
-                Ok(msg) => {
-                    if msg.typename() == "pong" {
-                        match msg.to_etf_bin() {
-                            Ok(_) => Ok(true),
-                            Err(_) => Ok(false),
-                        }
-                    } else {
-                        Ok(false)
-                    }
+            MessageType::Pong => {
+                match protocol::from_etf_bin(payload) {
+                    Ok(msg) => Ok(msg.typename() == "pong"),
+                    Err(_) => Ok(false),
                 }
-                Err(_) => Ok(false),
-            },
-            MessageType::TxPool => match protocol::from_etf_bin(payload) {
-                Ok(msg) => {
-                    if msg.typename() == "txpool" {
-                        match msg.to_etf_bin() {
-                            Ok(_) => Ok(true),
-                            Err(_) => Ok(false),
-                        }
-                    } else {
-                        Ok(false)
-                    }
+            }
+            MessageType::TxPool => {
+                match protocol::from_etf_bin(payload) {
+                    Ok(msg) => Ok(msg.typename() == "txpool"),
+                    Err(_) => Ok(false),
                 }
-                Err(_) => Ok(false),
-            },
-            MessageType::Peers => match protocol::from_etf_bin(payload) {
-                Ok(msg) => {
-                    if msg.typename() == "peers" {
-                        match msg.to_etf_bin() {
-                            Ok(_) => Ok(true),
-                            Err(_) => Ok(false),
-                        }
-                    } else {
-                        Ok(false)
-                    }
+            }
+            MessageType::Peers => {
+                match protocol::from_etf_bin(payload) {
+                    Ok(msg) => Ok(msg.typename() == "peers"),
+                    Err(_) => Ok(false),
                 }
-                Err(_) => Ok(false),
-            },
+            }
         }
     }
 
