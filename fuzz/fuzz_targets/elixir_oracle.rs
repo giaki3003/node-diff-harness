@@ -194,6 +194,9 @@ impl ElixirOracle {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
+                .env("LC_ALL", "C")         // Force C locale for binary I/O
+                .env("LANG", "C")           // Force C language for binary I/O  
+                .env("ERL_AFLAGS", "-noshell +A4 +K true") // Elixir/Erlang flags for binary I/O
                 .spawn()
             {
                 Ok(child) => {
