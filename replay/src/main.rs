@@ -158,15 +158,51 @@ fn load_trace_file(path: &str, format: &str) -> Result<Trace> {
     let data = fs::read(path).with_context(|| format!("Failed to read trace file: {}", path))?;
 
     match format {
-        "json" => load_json_trace(&data),
-        "bincode" => load_bincode_trace(&data),
-        "libfuzzer" => load_libfuzzer_trace(&data),
-        "auto" => {
-            // Try libfuzzer first (most common from fuzzer), then JSON, then bincode
+        "json" => {
+            println!("🔍 Loading as JSON format");
+            load_json_trace(&data)
+        }
+        "bincode" => {
+            println!("🔍 Loading as bincode format");
+            load_bincode_trace(&data)
+        }
+        "libfuzzer" => {
+            println!("🔍 Loading as libfuzzer format");
             load_libfuzzer_trace(&data)
-                .or_else(|_| load_json_trace(&data))
-                .or_else(|_| load_bincode_trace(&data))
-                .context("Could not parse trace as libfuzzer, JSON, or bincode")
+        }
+        "auto" => {
+            // Smart auto-detection based on file extension first
+            if path.ends_with(".json") {
+                println!("🔍 Auto-detected JSON format from .json extension");
+                load_json_trace(&data).context("Failed to parse as JSON (auto-detected)")
+            } else if path.ends_with(".bincode") {
+                println!("🔍 Auto-detected bincode format from .bincode extension");
+                load_bincode_trace(&data).context("Failed to parse as bincode (auto-detected)")
+            } else {
+                // For ambiguous files, try JSON first (safer), then libfuzzer, then bincode
+                println!("🔍 No clear extension, trying JSON → libfuzzer → bincode");
+                load_json_trace(&data)
+                    .or_else(|json_err| {
+                        println!("   JSON parsing failed, trying libfuzzer format");
+                        load_libfuzzer_trace(&data).map_err(|libfuzzer_err| {
+                            anyhow::anyhow!(
+                                "Auto-detection failed. JSON error: {}. Libfuzzer error: {}",
+                                json_err,
+                                libfuzzer_err
+                            )
+                        })
+                    })
+                    .or_else(|prev_err| {
+                        println!("   Libfuzzer parsing failed, trying bincode format");
+                        load_bincode_trace(&data).map_err(|bincode_err| {
+                            anyhow::anyhow!(
+                                "All formats failed. Previous errors: {}. Bincode error: {}",
+                                prev_err,
+                                bincode_err
+                            )
+                        })
+                    })
+            }
         }
         _ => anyhow::bail!("Unsupported format: {}", format),
     }
