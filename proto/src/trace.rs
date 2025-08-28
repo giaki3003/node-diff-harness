@@ -92,8 +92,12 @@ impl Arbitrary<'_> for Trace {
         let num_ops = u.int_in_range(1..=MAX_OPS)?;
         let mut ops = Vec::with_capacity(num_ops);
 
+        // CONSTRAINT: Single message type per trace to match real network behavior
+        // Real nodes process individual messages, not mixed operation sequences
+        let operation_type = u.int_in_range(0..=4)?;
+        
         for _ in 0..num_ops {
-            ops.push(u.arbitrary::<Operation>()?);
+            ops.push(Operation::arbitrary_of_type(u, operation_type)?);
         }
 
         Ok(Trace { seed, ops })
@@ -116,6 +120,73 @@ impl Arbitrary<'_> for Operation {
                 let mut txs = Vec::with_capacity(num_txs);
                 for _ in 0..num_txs {
                     let tx_size = u.int_in_range(0..=MAX_TX_SIZE)?;
+                    let tx_data: Vec<u8> = (0..tx_size)
+                        .map(|_| u.arbitrary())
+                        .collect::<Result<Vec<_>>>()?;
+                    txs.push(tx_data);
+                }
+                Ok(Operation::TxPool { txs })
+            }
+
+            2 => {
+                let num_ips = u.int_in_range(0..=MAX_IPS)?;
+                let mut ips = Vec::with_capacity(num_ips);
+                for _ in 0..num_ips {
+                    // Generate realistic IP addresses
+                    let ip = format!(
+                        "{}.{}.{}.{}",
+                        u.int_in_range(1..=255)?,
+                        u.int_in_range(0..=255)?,
+                        u.int_in_range(0..=255)?,
+                        u.int_in_range(1..=255)?
+                    );
+                    ips.push(ip);
+                }
+                Ok(Operation::Peers { ips })
+            }
+
+            3 => {
+                let tx_size = u.int_in_range(0..=MAX_TX_SIZE)?;
+                let tx_data: Vec<u8> = (0..tx_size)
+                    .map(|_| u.arbitrary())
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Operation::ProcessTx {
+                    tx_data,
+                    is_special_meeting: u.arbitrary()?,
+                })
+            }
+
+            4 => {
+                let msg_type = u.arbitrary::<MessageType>()?;
+                let payload_size = u.int_in_range(0..=1000)?;
+                let payload: Vec<u8> = (0..payload_size)
+                    .map(|_| u.arbitrary())
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Operation::SerializeMessage { msg_type, payload })
+            }
+
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Operation {
+    /// Generate an operation of a specific type for constrained fuzzing
+    fn arbitrary_of_type(u: &mut Unstructured<'_>, operation_type: usize) -> Result<Self> {
+        match operation_type {
+            0 => Ok(Operation::Ping {
+                temporal_height: u.int_in_range(1..=1000000)?,  // Avoid zero values
+                temporal_slot: u.int_in_range(1..=10000)?,
+                rooted_height: u.int_in_range(1..=1000000)?,
+                rooted_slot: u.int_in_range(1..=10000)?,
+                timestamp_ms: u.int_in_range(1600000000000..=1800000000000)?, // Realistic timestamps
+            }),
+
+            1 => {
+                let num_txs = u.int_in_range(1..=MAX_TXS)?; // At least 1 tx
+                let mut txs = Vec::with_capacity(num_txs);
+                for _ in 0..num_txs {
+                    let tx_size = u.int_in_range(10..=MAX_TX_SIZE)?; // Minimum reasonable size
                     let tx_data: Vec<u8> = (0..tx_size)
                         .map(|_| u.arbitrary())
                         .collect::<Result<Vec<_>>>()?;
