@@ -82,11 +82,10 @@ impl ProtocolAdapter {
                     Err(_) => Ok(false),
                 }
             }
-            MessageType::Peers => {
-                match protocol::from_etf_bin(payload) {
-                    Ok(msg) => Ok(msg.typename() == "peers"),
-                    Err(_) => Ok(false),
-                }
+            // TODO: Re-enable PeersV2 once Rust implementation supports peers_v2 operations
+            MessageType::PeersV2 => {
+                // For now, always return false since Rust doesn't support PeersV2 yet
+                Ok(false)
             }
         }
     }

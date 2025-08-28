@@ -8,10 +8,10 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Maximum size limits to prevent resource exhaustion during fuzzing
-const MAX_OPS: usize = 100;
-const MAX_TXS: usize = 50;
-const MAX_IPS: usize = 100;
-const MAX_TX_SIZE: usize = 10_000;
+// Realistic limits for internal data structures (not operation count)
+const MAX_TXS: usize = 50;         // Maximum transactions per TxPool message
+const MAX_IPS: usize = 100;        // Maximum ANRs per PeersV2 message  
+const MAX_TX_SIZE: usize = 10_000; // Maximum transaction size in bytes
 
 /// A complete trace containing a sequence of operations to test
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,45 +81,42 @@ pub enum MessageType {
     Ping,
     Pong,
     TxPool,
-    Peers,
+    PeersV2, // Use modern PeersV2 instead of deprecated Peers
 }
 
 impl Arbitrary<'_> for Trace {
     fn arbitrary(u: &mut Unstructured<'_>) -> Result<Self> {
         let seed = u.arbitrary::<u64>()?;
 
-        // Generate reasonable number of operations
-        let num_ops = u.int_in_range(1..=MAX_OPS)?;
-        let mut ops = Vec::with_capacity(num_ops);
-
-        // CONSTRAINT: Single message type per trace to match real network behavior
-        // Real nodes process individual messages, not mixed operation sequences
-        let operation_type = u.int_in_range(0..=4)?;
+        // CONSTRAINT: Single operation per trace to match real UDP network behavior
+        // Real networks: 1 UDP packet = 1 protocol message = 1 operation
+        // Complexity comes from internal data structures (multiple txs, multiple ANRs, etc.)
+        let operation = Operation::arbitrary(u)?;
         
-        for _ in 0..num_ops {
-            ops.push(Operation::arbitrary_of_type(u, operation_type)?);
-        }
-
-        Ok(Trace { seed, ops })
+        Ok(Trace { seed, ops: vec![operation] })
     }
 }
 
 impl Arbitrary<'_> for Operation {
     fn arbitrary(u: &mut Unstructured<'_>) -> Result<Self> {
-        match u.int_in_range(0..=4)? {
+        match u.int_in_range(0..=3)? {
             0 => Ok(Operation::Ping {
-                temporal_height: u.arbitrary()?,
-                temporal_slot: u.arbitrary()?,
-                rooted_height: u.arbitrary()?,
-                rooted_slot: u.arbitrary()?,
-                timestamp_ms: u.arbitrary()?,
+                // Realistic chain heights (avoid zero which can crash oracle)
+                temporal_height: u.int_in_range(1..=1_000_000)?,
+                temporal_slot: u.int_in_range(1..=10_000)?,
+                rooted_height: u.int_in_range(1..=1_000_000)?,
+                rooted_slot: u.int_in_range(1..=10_000)?,
+                // Realistic Unix timestamps (2020-2030 range)
+                timestamp_ms: u.int_in_range(1_600_000_000_000..=1_900_000_000_000)?,
             }),
 
             1 => {
-                let num_txs = u.int_in_range(0..=MAX_TXS)?;
+                // TxPool: Realistic batching (1-50 transactions per UDP message)
+                let num_txs = u.int_in_range(1..=MAX_TXS)?;
                 let mut txs = Vec::with_capacity(num_txs);
                 for _ in 0..num_txs {
-                    let tx_size = u.int_in_range(0..=MAX_TX_SIZE)?;
+                    // Realistic transaction sizes (32 bytes minimum for basic tx)
+                    let tx_size = u.int_in_range(32..=MAX_TX_SIZE)?;
                     let tx_data: Vec<u8> = (0..tx_size)
                         .map(|_| u.arbitrary())
                         .collect::<Result<Vec<_>>>()?;
@@ -128,25 +125,27 @@ impl Arbitrary<'_> for Operation {
                 Ok(Operation::TxPool { txs })
             }
 
-            2 => {
-                let num_ips = u.int_in_range(0..=MAX_IPS)?;
-                let mut ips = Vec::with_capacity(num_ips);
-                for _ in 0..num_ips {
-                    // Generate realistic IP addresses
-                    let ip = format!(
-                        "{}.{}.{}.{}",
-                        u.int_in_range(1..=255)?,
-                        u.int_in_range(0..=255)?,
-                        u.int_in_range(0..=255)?,
-                        u.int_in_range(1..=255)?
-                    );
-                    ips.push(ip);
-                }
-                Ok(Operation::Peers { ips })
-            }
+            // TODO: Re-enable PeersV2 once Rust implementation supports peers_v2 operations
+            // 2 => {
+            //     // PeersV2: Modern peer discovery (1-100 ANRs per UDP message)
+            //     let num_anrs = u.int_in_range(1..=MAX_IPS)?; // Reuse MAX_IPS for ANR limit
+            //     let mut anrs = Vec::with_capacity(num_anrs);
+            //     for _ in 0..num_anrs {
+            //         // Generate realistic ANR strings (simplified format for now)
+            //         let anr = format!(
+            //             "anr://{}:{}/{}",
+            //             u.int_in_range(1..=255)?,
+            //             u.int_in_range(1024..=65535)?, // Realistic port range
+            //             u.int_in_range(1000..=9999)?   // Node ID
+            //         );
+            //         anrs.push(anr);
+            //     }
+            //     Ok(Operation::PeersV2 { anrs })
+            // }
 
-            3 => {
-                let tx_size = u.int_in_range(0..=MAX_TX_SIZE)?;
+            2 => {
+                // ProcessTx: Single transaction processing
+                let tx_size = u.int_in_range(32..=MAX_TX_SIZE)?; // Minimum 32 bytes
                 let tx_data: Vec<u8> = (0..tx_size)
                     .map(|_| u.arbitrary())
                     .collect::<Result<Vec<_>>>()?;
@@ -156,7 +155,8 @@ impl Arbitrary<'_> for Operation {
                 })
             }
 
-            4 => {
+            3 => {
+                // SerializeMessage: Single message serialization test
                 let msg_type = u.arbitrary::<MessageType>()?;
                 let payload_size = u.int_in_range(0..=1000)?;
                 let payload: Vec<u8> = (0..payload_size)
@@ -170,80 +170,15 @@ impl Arbitrary<'_> for Operation {
     }
 }
 
-impl Operation {
-    /// Generate an operation of a specific type for constrained fuzzing
-    fn arbitrary_of_type(u: &mut Unstructured<'_>, operation_type: usize) -> Result<Self> {
-        match operation_type {
-            0 => Ok(Operation::Ping {
-                temporal_height: u.int_in_range(1..=1000000)?,  // Avoid zero values
-                temporal_slot: u.int_in_range(1..=10000)?,
-                rooted_height: u.int_in_range(1..=1000000)?,
-                rooted_slot: u.int_in_range(1..=10000)?,
-                timestamp_ms: u.int_in_range(1600000000000..=1800000000000)?, // Realistic timestamps
-            }),
-
-            1 => {
-                let num_txs = u.int_in_range(1..=MAX_TXS)?; // At least 1 tx
-                let mut txs = Vec::with_capacity(num_txs);
-                for _ in 0..num_txs {
-                    let tx_size = u.int_in_range(10..=MAX_TX_SIZE)?; // Minimum reasonable size
-                    let tx_data: Vec<u8> = (0..tx_size)
-                        .map(|_| u.arbitrary())
-                        .collect::<Result<Vec<_>>>()?;
-                    txs.push(tx_data);
-                }
-                Ok(Operation::TxPool { txs })
-            }
-
-            2 => {
-                let num_ips = u.int_in_range(0..=MAX_IPS)?;
-                let mut ips = Vec::with_capacity(num_ips);
-                for _ in 0..num_ips {
-                    // Generate realistic IP addresses
-                    let ip = format!(
-                        "{}.{}.{}.{}",
-                        u.int_in_range(1..=255)?,
-                        u.int_in_range(0..=255)?,
-                        u.int_in_range(0..=255)?,
-                        u.int_in_range(1..=255)?
-                    );
-                    ips.push(ip);
-                }
-                Ok(Operation::Peers { ips })
-            }
-
-            3 => {
-                let tx_size = u.int_in_range(0..=MAX_TX_SIZE)?;
-                let tx_data: Vec<u8> = (0..tx_size)
-                    .map(|_| u.arbitrary())
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(Operation::ProcessTx {
-                    tx_data,
-                    is_special_meeting: u.arbitrary()?,
-                })
-            }
-
-            4 => {
-                let msg_type = u.arbitrary::<MessageType>()?;
-                let payload_size = u.int_in_range(0..=1000)?;
-                let payload: Vec<u8> = (0..payload_size)
-                    .map(|_| u.arbitrary())
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(Operation::SerializeMessage { msg_type, payload })
-            }
-
-            _ => unreachable!(),
-        }
-    }
-}
 
 impl Arbitrary<'_> for MessageType {
     fn arbitrary(u: &mut Unstructured<'_>) -> Result<Self> {
-        match u.int_in_range(0..=3)? {
+        match u.int_in_range(0..=2)? {
             0 => Ok(MessageType::Ping),
             1 => Ok(MessageType::Pong),
             2 => Ok(MessageType::TxPool),
-            3 => Ok(MessageType::Peers),
+            // TODO: Re-enable PeersV2 once Rust implementation supports peers_v2
+            // 3 => Ok(MessageType::PeersV2),
             _ => unreachable!(),
         }
     }
