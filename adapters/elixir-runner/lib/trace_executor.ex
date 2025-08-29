@@ -163,7 +163,6 @@ defmodule ElixirRunner.TraceExecutor do
   defp count_messages(results) do
     Enum.count(results, fn
       %{type: :protocol} -> true
-      %{type: :serialization} -> true
       _ -> false
     end)
   end

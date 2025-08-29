@@ -202,19 +202,14 @@ defmodule ElixirRunner.TxAdapter do
          true <- len <= @max_list_len or {:error, :too_large},
          true <- elems >= len or {:error, :too_large}
     do
-      {consumed, tail2, elems2} =
-        Enum.reduce_while(1..len, {1 + used, tail, elems - len}, fn _, {acc, bin, e} ->
-          case walk_one(bin, depth + 1, {e}) do
-            {:ok, {c, bin2, {e2}}} -> {:cont, {acc + c, bin2, e2}}
-            err -> {:halt, err}
-          end
-        end)
-        |> case do
-          {:error, _}=err -> err
-          other -> {:ok, other}
-        end
-      with {:ok, {c, t, e2}} <- {consumed, tail2, elems2} do
-        {:ok, {c, t, {e2}}}
+      case Enum.reduce_while(1..len, {1 + used, tail, elems - len}, fn _, {acc, bin, e} ->
+             case walk_one(bin, depth + 1, {e}) do
+               {:ok, {c, bin2, {e2}}} -> {:cont, {acc + c, bin2, e2}}
+               err -> {:halt, err}
+             end
+           end) do
+        {:error, _} = err -> err
+        {consumed, tail2, elems2} -> {:ok, {consumed, tail2, {elems2}}}
       end
     end
   end
@@ -226,21 +221,16 @@ defmodule ElixirRunner.TxAdapter do
          needed <- len * 2,
          true <- elems >= needed or {:error, :too_large}
     do
-      {consumed, tail2, elems2} =
-        Enum.reduce_while(1..len, {1 + used, tail, elems - needed}, fn _, {acc, bin, e} ->
-          with {:ok, {ck, bin1, {e1}}} <- walk_one(bin, depth + 1, {e}),
-               {:ok, {cv, bin2, {e2}}} <- walk_one(bin1, depth + 1, {e1})
-          do
-            {:cont, {acc + ck + cv, bin2, e2}}
-          else err -> {:halt, err}
-          end
-        end)
-        |> case do
-          {:error, _}=err -> err
-          other -> {:ok, other}
-        end
-      with {:ok, {c, t, e2}} <- {consumed, tail2, elems2} do
-        {:ok, {c, t, {e2}}}
+      case Enum.reduce_while(1..len, {1 + used, tail, elems - needed}, fn _, {acc, bin, e} ->
+             with {:ok, {ck, bin1, {e1}}} <- walk_one(bin, depth + 1, {e}),
+                  {:ok, {cv, bin2, {e2}}} <- walk_one(bin1, depth + 1, {e1})
+             do
+               {:cont, {acc + ck + cv, bin2, e2}}
+             else err -> {:halt, err}
+             end
+           end) do
+        {:error, _} = err -> err
+        {consumed, tail2, elems2} -> {:ok, {consumed, tail2, {elems2}}}
       end
     end
   end
