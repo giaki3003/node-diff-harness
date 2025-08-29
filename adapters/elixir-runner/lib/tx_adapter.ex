@@ -49,7 +49,7 @@ defmodule ElixirRunner.TxAdapter do
         byte_size(tx_binary) > max_tx_size ->
           {:ok, %{type: :transaction, validation_result: @canon_too_large, tx_size: byte_size(tx_binary)}}
 
-        suspicious_vanilla_prefix(tx_binary, max_tx_size) ->
+        vanilla_preflight_all(tx_binary) != :ok ->
           {:ok, %{type: :transaction, validation_result: @canon_too_large, tx_size: byte_size(tx_binary)}}
 
         true ->
@@ -140,43 +140,112 @@ defmodule ElixirRunner.TxAdapter do
     end
   end
 
-  # Check for VanillaSer allocation bombs using proper format knowledge and FF flood detection
-  defp suspicious_vanilla_prefix(<<tag, b0, rest::binary>>, max_tx_size) when tag in [5, 6, 7] do
-    # FF flood heuristic: ≥3 FF in first 8 bytes screams "absurd length"
-    ff_count =
-      rest
-      |> :binary.part(0, min(byte_size(rest), 8))
-      |> :binary.bin_to_list()
-      |> Enum.count(& &1 == 0xFF)
+  # VanillaSer preflight validation constants - keep identical to Rust side
+  @max_tx_size 393_216
+  @max_list_len 4_096
+  @max_map_len 4_096
+  @max_depth 16
+  @max_elems 32_768
 
-    if ff_count >= 3 do
-      true
-    else
-      len_of_mag = band(b0, 0x7F)
-      sign = band(b0, 0x80) != 0
+  # Allocation-free VanillaSer preflight validation
+  defp vanilla_preflight_all(bin) do
+    # emulate decode_all(): iterate until buffer empty
+    do_preflight(bin, @max_elems)
+  end
 
-      cond do
-        sign or len_of_mag == 0 or len_of_mag > 8 ->
-          true
+  defp do_preflight(<<>>, _elems), do: :ok
+  defp do_preflight(bin, elems) do
+    case walk_one(bin, 0, {elems}) do
+      {:ok, {consumed, tail, {elems2}}} -> do_preflight(tail, elems2)
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
-        byte_size(rest) < len_of_mag ->
-          true # malformed varint ⇒ suspicious
+  defp read_len(<<b0, rest::binary>>) do
+    sign = (b0 &&& 0x80) != 0
+    mag_len = b0 &&& 0x7F
+    cond do
+      sign -> {:error, :malformed}
+      mag_len > 8 -> {:error, :too_large}
+      byte_size(rest) < mag_len -> {:error, :malformed}
+      true ->
+        <<mag::unsigned-big-integer-size(mag_len)-unit(8), tail::binary>> = rest
+        {:ok, {mag, 1 + mag_len, tail}}
+    end
+  end
+  defp read_len(<<>>), do: {:error, :malformed}
 
-        true ->
-          <<mag_bytes::binary-size(len_of_mag), _::binary>> = rest
-          mag = :binary.decode_unsigned(mag_bytes)
+  defp walk_one(<<>>, _depth, _budget), do: {:error, :malformed}
+  defp walk_one(_bin, depth, _budget) when depth > @max_depth, do: {:error, :too_large}
 
-          max =
-            case tag do
-              5 -> max_tx_size     # bytes length
-              6 -> 4_096           # list length
-              7 -> 4_096           # map length
-            end
+  defp walk_one(<<0, rest::binary>>, _depth, budget), do: {:ok, {1, rest, budget}}
+  defp walk_one(<<tag, rest::binary>>, depth, budget) when tag in [1,2,3,4] do
+    with {:ok, {_n, used, tail}} <- read_len(rest) do
+      {:ok, {1 + used, tail, budget}}
+    end
+  end
 
-          mag > max
+  # bytes
+  defp walk_one(<<5, rest::binary>>, _depth, budget) do
+    with {:ok, {len, used, tail}} <- read_len(rest),
+         true <- len <= @max_tx_size or {:error, :too_large},
+         true <- byte_size(tail) >= len or {:error, :malformed}
+    do
+      <<_skip::binary-size(len), tail2::binary>> = tail
+      {:ok, {1 + used + len, tail2, budget}}
+    end
+  end
+
+  # list
+  defp walk_one(<<6, rest::binary>>, depth, {elems}) do
+    with {:ok, {len, used, tail}} <- read_len(rest),
+         true <- len <= @max_list_len or {:error, :too_large},
+         true <- elems >= len or {:error, :too_large}
+    do
+      {consumed, tail2, elems2} =
+        Enum.reduce_while(1..len, {1 + used, tail, elems - len}, fn _, {acc, bin, e} ->
+          case walk_one(bin, depth + 1, {e}) do
+            {:ok, {c, bin2, {e2}}} -> {:cont, {acc + c, bin2, e2}}
+            err -> {:halt, err}
+          end
+        end)
+        |> case do
+          {:error, _}=err -> err
+          other -> {:ok, other}
+        end
+      with {:ok, {c, t, e2}} <- {consumed, tail2, elems2} do
+        {:ok, {c, t, {e2}}}
       end
     end
   end
+
+  # map
+  defp walk_one(<<7, rest::binary>>, depth, {elems}) do
+    with {:ok, {len, used, tail}} <- read_len(rest),
+         true <- len <= @max_map_len or {:error, :too_large},
+         needed <- len * 2,
+         true <- elems >= needed or {:error, :too_large}
+    do
+      {consumed, tail2, elems2} =
+        Enum.reduce_while(1..len, {1 + used, tail, elems - needed}, fn _, {acc, bin, e} ->
+          with {:ok, {ck, bin1, {e1}}} <- walk_one(bin, depth + 1, {e}),
+               {:ok, {cv, bin2, {e2}}} <- walk_one(bin1, depth + 1, {e1})
+          do
+            {:cont, {acc + ck + cv, bin2, e2}}
+          else err -> {:halt, err}
+          end
+        end)
+        |> case do
+          {:error, _}=err -> err
+          other -> {:ok, other}
+        end
+      with {:ok, {c, t, e2}} <- {consumed, tail2, elems2} do
+        {:ok, {c, t, {e2}}}
+      end
+    end
+  end
+
+  defp walk_one(_unknown, _depth, _budget), do: {:error, :malformed}
 
   defp suspicious_vanilla_prefix(_other, _max_tx_size), do: false
 

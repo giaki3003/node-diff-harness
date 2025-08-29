@@ -6,9 +6,18 @@ use ama_core::consensus::tx;
 use anyhow::Result;
 use proto::CanonErr;
 
-// VanillaSer bomb detection constants
-const MAX_SAFE_TX_SIZE: usize = 393_216;   // match Elixir :ama, :tx_size
-const MAX_COLLECTION_LEN: u64 = 4_096;     // conservative, keeps decode bounded
+#[derive(Debug)]
+pub enum GuardErr { 
+    Malformed, 
+    TooLarge 
+}
+
+// VanillaSer preflight validation constants - keep identical to Elixir side
+const MAX_TX_SIZE: usize = 393_216;     // cap for bytes blobs
+const MAX_LIST_LEN: u64 = 4_096;
+const MAX_MAP_LEN: u64 = 4_096;
+const MAX_DEPTH: usize = 16;
+const MAX_ELEMS: u64 = 32_768;       // global sanity cap
 
 /// Adapter for transaction validation operations
 pub struct TxAdapter {
@@ -26,13 +35,16 @@ impl TxAdapter {
         tx_data: &[u8],
         is_special_meeting: bool,
     ) -> Result<u32> {
-        if tx_data.len() > MAX_SAFE_TX_SIZE {
+        if tx_data.len() > MAX_TX_SIZE {
             return Ok(CanonErr::TooLarge.code());
         }
 
-        // Prefilter bomb-y VanillaSer prefixes **before** decode
-        if Self::suspicious_vanilla_prefix(tx_data) {
-            return Ok(CanonErr::TooLarge.code()); // TooLarge-equivalent for our harness
+        // Allocation-free preflight validation **before** decode
+        match Self::vanilla_preflight(tx_data) {
+            Ok(()) => {}, // Safe to decode
+            Err(GuardErr::TooLarge) | Err(GuardErr::Malformed) => {
+                return Ok(CanonErr::TooLarge.code()); // Canonical error for bombs/malformed
+            }
         }
 
         // Direct validation - let VanillaSer and tx validation handle all edge cases
@@ -85,48 +97,106 @@ impl TxAdapter {
         }
     }
 
-    /// Parse VanillaSer length encoding from bytes  
-    /// Returns (magnitude, bytes_consumed) or None if invalid
-    fn parse_vanilla_len(bytes: &[u8]) -> Option<(u64, usize)> {
-        if bytes.len() < 2 { return None; }
-        let b0 = bytes[1];
-        let len_of_mag = (b0 & 0x7F) as usize;
-        let sign = (b0 & 0x80) != 0;
-
-        // Defensive: reject negative, zero, or very long magnitudes
-        if sign || len_of_mag == 0 || len_of_mag > 8 { return None; }
-        if bytes.len() < 2 + len_of_mag { return None; }
-
-        let mut mag: u64 = 0;
-        for &b in &bytes[2..2 + len_of_mag] {
-            mag = (mag << 8) | (b as u64);
+    /// Allocation-free VanillaSer preflight validation
+    /// Validates the entire VanillaSer structure without allocating memory
+    fn vanilla_preflight(bytes: &[u8]) -> Result<(), GuardErr> {
+        let mut i = 0usize;
+        let mut elems = MAX_ELEMS;
+        while i < bytes.len() {
+            let used = Self::walk_one(&bytes[i..], 0, &mut elems)?;
+            i += used;
         }
-        Some((mag, 2 + len_of_mag))
+        Ok(())
     }
 
-    /// Check for VanillaSer allocation bombs using proper format knowledge and FF flood detection
-    fn suspicious_vanilla_prefix(bytes: &[u8]) -> bool {
-        if bytes.len() < 2 { return false; }
-        let tag = bytes[0];
+    /// Read VanillaSer length header
+    #[inline]
+    fn read_len(s: &[u8]) -> Result<(u64, usize), GuardErr> {
+        if s.is_empty() { return Err(GuardErr::Malformed); }
+        let b0 = s[0];
+        if (b0 & 0x80) != 0 { return Err(GuardErr::Malformed); }    // sign/continuation not allowed
+        let mag_len = (b0 & 0x7F) as usize;
+        let s = &s[1..];
+        if mag_len > 8 { return Err(GuardErr::TooLarge); }           // reject absurd magnitudes
+        if s.len() < mag_len { return Err(GuardErr::Malformed); }
+        let mag = if mag_len == 0 { 0 } else { u64::from_be_bytes({
+            let mut buf = [0u8; 8];
+            buf[8 - mag_len..].copy_from_slice(&s[..mag_len]);
+            buf
+        })};
+        Ok((mag, 1 + mag_len))
+    }
 
-        if matches!(tag, 5 | 6 | 7) {
-            // Cheap FF flood heuristic (classic varint bomb)
-            let ff = bytes[1..].iter().take(8).filter(|&&b| b == 0xFF).count();
-            if ff >= 3 { return true; }
+    /// Walk one VanillaSer value without allocating
+    fn walk_one(s: &[u8], depth: usize, elem_budget: &mut u64) -> Result<usize, GuardErr> {
+        if depth > MAX_DEPTH { return Err(GuardErr::TooLarge); }
+        if s.is_empty() { return Err(GuardErr::Malformed); }
 
-            if let Some((len, _consumed)) = Self::parse_vanilla_len(bytes) {
-                match tag {
-                    5 => len > MAX_SAFE_TX_SIZE as u64, // bytes length
-                    6 | 7 => len > MAX_COLLECTION_LEN,  // list/map length
-                    _ => false,
-                }
-            } else {
-                // malformed varint ⇒ treat as suspicious
-                true
+        // Read the tag (VanillaSer: 1 byte)
+        let tag = s[0];
+        let s = &s[1..];
+        let mut consumed = 1usize;
+
+        match tag {
+            // scalar primitives that do not allocate: just skip their fixed/encoded body
+            0 => { /* nil/unit */ }
+            1 | 2 | 3 | 4 => {
+                // varint/small ints with length-of-mag encoding
+                let (_n, used) = Self::read_len(s)?; 
+                consumed += used;
             }
-        } else {
-            false
+
+            // bytes
+            5 => {
+                let (len, used) = Self::read_len(s)?; 
+                consumed += used;
+                if len as usize > MAX_TX_SIZE { return Err(GuardErr::TooLarge); }
+                if s.len() < used + (len as usize) { return Err(GuardErr::Malformed); }
+                consumed += len as usize;
+            }
+
+            // list
+            6 => {
+                let (len, used) = Self::read_len(s)?; 
+                consumed += used;
+                if len > MAX_LIST_LEN { return Err(GuardErr::TooLarge); }
+                // global element budget to prevent nested bombs
+                if *elem_budget < len { return Err(GuardErr::TooLarge); }
+                *elem_budget -= len;
+                let mut rest = &s[used..];
+                let mut local = 0usize;
+                for _ in 0..len {
+                    let c = Self::walk_one(rest, depth + 1, elem_budget)?;
+                    local += c;
+                    rest = &rest[c..];
+                }
+                consumed += local;
+            }
+
+            // map
+            7 => {
+                let (len, used) = Self::read_len(s)?; 
+                consumed += used;
+                if len > MAX_MAP_LEN { return Err(GuardErr::TooLarge); }
+                let needed = len.checked_mul(2).ok_or(GuardErr::TooLarge)?;
+                if *elem_budget < needed { return Err(GuardErr::TooLarge); }
+                *elem_budget -= needed;
+                let mut rest = &s[used..];
+                let mut local = 0usize;
+                for _ in 0..len {
+                    let ck = Self::walk_one(rest, depth + 1, elem_budget)?;
+                    rest = &rest[ck..];
+                    let cv = Self::walk_one(rest, depth + 1, elem_budget)?;
+                    rest = &rest[cv..];
+                    local += ck + cv;
+                }
+                consumed += local;
+            }
+
+            // Unknown tags -> treat as malformed (safer for fuzzing harness)
+            _ => return Err(GuardErr::Malformed),
         }
+        Ok(consumed)
     }
 
 }
