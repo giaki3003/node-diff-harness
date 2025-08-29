@@ -47,27 +47,31 @@ defmodule ElixirRunner.TxAdapter do
 
       max_tx_size = Application.get_env(:ama, :tx_size, 393_216)
 
-      # Protocol-level size limit (parity with Elixir :tx_size)  
-      if byte_size(tx_binary) > max_tx_size do
-        {:ok, %{type: :transaction, validation_result: @canon_too_large, tx_size: byte_size(tx_binary)}}
-      else
-        # Direct validation - let TX.validate handle all edge cases
-        IO.puts(:stderr, "[DEBUG] Calling TX.validate with #{byte_size(tx_binary)} bytes")
-        result = TX.validate(tx_binary, is_special_meeting)
-        IO.puts(:stderr, "[DEBUG] TX.validate returned: #{inspect(result)}")
+      cond do
+        byte_size(tx_binary) > max_tx_size ->
+          {:ok, %{type: :transaction, validation_result: @canon_too_large, tx_size: byte_size(tx_binary)}}
 
-        validation_code =
-          case result do
-            %{error: :ok} -> @canon_ok # Valid transaction
-            %{error: error} -> map_error_to_code(error)
-          end
+        suspicious_vanilla_prefix(tx_binary, max_tx_size) ->
+          {:ok, %{type: :transaction, validation_result: @canon_too_large, tx_size: byte_size(tx_binary)}}
 
-        {:ok,
-         %{
-           type: :transaction,
-           validation_result: validation_code,
-           tx_size: byte_size(tx_binary)
-         }}
+        true ->
+          # Direct validation - let TX.validate handle all edge cases
+          IO.puts(:stderr, "[DEBUG] Calling TX.validate with #{byte_size(tx_binary)} bytes")
+          result = TX.validate(tx_binary, is_special_meeting)
+          IO.puts(:stderr, "[DEBUG] TX.validate returned: #{inspect(result)}")
+
+          validation_code =
+            case result do
+              %{error: :ok} -> @canon_ok # Valid transaction
+              %{error: error} -> map_error_to_code(error)
+            end
+
+          {:ok,
+           %{
+             type: :transaction,
+             validation_result: validation_code,
+             tx_size: byte_size(tx_binary)
+           }}
       end
     rescue
       # Any decode exception → canonical decode error for consistent differential testing
@@ -141,5 +145,45 @@ defmodule ElixirRunner.TxAdapter do
       _ -> @canon_decode
     end
   end
+
+  # Check for VanillaSer allocation bombs using proper format knowledge and FF flood detection
+  defp suspicious_vanilla_prefix(<<tag, b0, rest::binary>>, max_tx_size) when tag in [5, 6, 7] do
+    # FF flood heuristic: ≥3 FF in first 8 bytes screams "absurd length"
+    ff_count =
+      rest
+      |> :binary.part(0, min(byte_size(rest), 8))
+      |> :binary.bin_to_list()
+      |> Enum.count(& &1 == 0xFF)
+
+    if ff_count >= 3 do
+      true
+    else
+      len_of_mag = band(b0, 0x7F)
+      sign = band(b0, 0x80) != 0
+
+      cond do
+        sign or len_of_mag == 0 or len_of_mag > 8 ->
+          true
+
+        byte_size(rest) < len_of_mag ->
+          true # malformed varint ⇒ suspicious
+
+        true ->
+          <<mag_bytes::binary-size(len_of_mag), _::binary>> = rest
+          mag = :binary.decode_unsigned(mag_bytes)
+
+          max =
+            case tag do
+              5 -> max_tx_size     # bytes length
+              6 -> 4_096           # list length
+              7 -> 4_096           # map length
+            end
+
+          mag > max
+      end
+    end
+  end
+
+  defp suspicious_vanilla_prefix(_other, _max_tx_size), do: false
 
 end

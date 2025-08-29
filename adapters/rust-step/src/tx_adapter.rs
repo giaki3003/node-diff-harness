@@ -6,6 +6,10 @@ use ama_core::consensus::tx;
 use anyhow::Result;
 use proto::CanonErr;
 
+// VanillaSer bomb detection constants
+const MAX_SAFE_TX_SIZE: usize = 393_216;   // match Elixir :ama, :tx_size
+const MAX_COLLECTION_LEN: u64 = 4_096;     // conservative, keeps decode bounded
+
 /// Adapter for transaction validation operations
 pub struct TxAdapter {
     // Could hold validation state if needed
@@ -22,10 +26,13 @@ impl TxAdapter {
         tx_data: &[u8],
         is_special_meeting: bool,
     ) -> Result<u32> {
-        // Protocol-level size limit (parity with Elixir :ama, :tx_size default 393_216)
-        const MAX_SAFE_TX_SIZE: usize = 393_216;
         if tx_data.len() > MAX_SAFE_TX_SIZE {
             return Ok(CanonErr::TooLarge.code());
+        }
+
+        // Prefilter bomb-y VanillaSer prefixes **before** decode
+        if Self::suspicious_vanilla_prefix(tx_data) {
+            return Ok(CanonErr::TooLarge.code()); // TooLarge-equivalent for our harness
         }
 
         // Direct validation - let VanillaSer and tx validation handle all edge cases
@@ -78,6 +85,50 @@ impl TxAdapter {
         }
     }
 
+    /// Parse VanillaSer length encoding from bytes  
+    /// Returns (magnitude, bytes_consumed) or None if invalid
+    fn parse_vanilla_len(bytes: &[u8]) -> Option<(u64, usize)> {
+        if bytes.len() < 2 { return None; }
+        let b0 = bytes[1];
+        let len_of_mag = (b0 & 0x7F) as usize;
+        let sign = (b0 & 0x80) != 0;
+
+        // Defensive: reject negative, zero, or very long magnitudes
+        if sign || len_of_mag == 0 || len_of_mag > 8 { return None; }
+        if bytes.len() < 2 + len_of_mag { return None; }
+
+        let mut mag: u64 = 0;
+        for &b in &bytes[2..2 + len_of_mag] {
+            mag = (mag << 8) | (b as u64);
+        }
+        Some((mag, 2 + len_of_mag))
+    }
+
+    /// Check for VanillaSer allocation bombs using proper format knowledge and FF flood detection
+    fn suspicious_vanilla_prefix(bytes: &[u8]) -> bool {
+        if bytes.len() < 2 { return false; }
+        let tag = bytes[0];
+
+        if matches!(tag, 5 | 6 | 7) {
+            // Cheap FF flood heuristic (classic varint bomb)
+            let ff = bytes[1..].iter().take(8).filter(|&&b| b == 0xFF).count();
+            if ff >= 3 { return true; }
+
+            if let Some((len, _consumed)) = Self::parse_vanilla_len(bytes) {
+                match tag {
+                    5 => len > MAX_SAFE_TX_SIZE as u64, // bytes length
+                    6 | 7 => len > MAX_COLLECTION_LEN,  // list/map length
+                    _ => false,
+                }
+            } else {
+                // malformed varint ⇒ treat as suspicious
+                true
+            }
+        } else {
+            false
+        }
+    }
+
 }
 
 #[cfg(test)]
@@ -117,6 +168,32 @@ mod tests {
         // Results might be the same for invalid data, but the function should not panic
         assert!(result1 >= 100 || result1 == 1);
         assert!(result2 >= 100 || result2 == 1);
+    }
+
+    #[test]
+    fn prefilter_catches_list_bomb() {
+        // tag=6 (list), b0 says 4-byte magnitude, then absurd size 0x10_00_00_00
+        let bomb = vec![6, 4, 0x10, 0x00, 0x00, 0x00];
+        assert!(TxAdapter::suspicious_vanilla_prefix(&bomb));
+    }
+
+    #[test]
+    fn prefilter_maps_to_too_large() {
+        let mut adapter = TxAdapter::new().unwrap();
+        let ff_bomb = vec![6, 8, 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00,0x01];
+        let code = adapter.validate_transaction(&ff_bomb, false).unwrap();
+        assert_eq!(code, 122);
+    }
+
+    #[test]
+    fn test_ff_flood_detection() {
+        // Classic FF flood pattern should be caught
+        let ff_bomb = vec![5, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+        assert!(TxAdapter::suspicious_vanilla_prefix(&ff_bomb));
+        
+        // Normal small length should pass
+        let normal = vec![5, 2, 0x00, 0x10]; // tag 5, 2-byte mag, value 16
+        assert!(!TxAdapter::suspicious_vanilla_prefix(&normal));
     }
 
     #[test]

@@ -8,10 +8,10 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Maximum size limits to prevent resource exhaustion during fuzzing
-// Realistic limits for internal data structures (not operation count)
-const MAX_TXS: usize = 50;         // Maximum transactions per TxPool message
-const MAX_IPS: usize = 100;        // Maximum ANRs per PeersV2 message  
-const MAX_TX_SIZE: usize = 10_000; // Maximum transaction size in bytes
+// These limits match the official Elixir node configuration for realistic testing
+const MAX_TXS: usize = 50;           // Maximum transactions per TxPool message
+const MAX_IPS: usize = 100;          // Maximum ANRs per PeersV2 message  
+const MAX_TX_SIZE: usize = 393_216;  // Maximum transaction size in bytes (matches :ama, :tx_size)
 
 /// A complete trace containing a sequence of operations to test
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,11 +104,35 @@ fn reasonable_tx_bytes(u: &mut Unstructured<'_>, max: usize) -> Result<Vec<u8>> 
     for b in &mut v { 
         *b = u.arbitrary()?; 
     }
-    // Nudge away from malicious varint prefixes:
-    if n >= 8 && matches!(v[0], 5|6|7) && v[1] > 3 { 
-        v[1] = 3; // cap magnitude length
+    
+    // Defang obvious VanillaSer allocation bombs in generated data
+    Ok(defang_vanilla_prefix(v))
+}
+
+/// Clamp obvious {5,6,7}+varint bombs in the first 128 bytes
+/// This is a lightweight fix to reduce wasted fuzzing cycles, not a security measure
+fn defang_vanilla_prefix(mut b: Vec<u8>) -> Vec<u8> {
+    let scan = b.len().min(128);
+    let mut i = 0usize;
+    while i + 2 < scan {
+        match b[i] {
+            5 | 6 | 7 => {
+                // If the next few bytes look like a "huge" varint (many 0xFF)
+                let window_end = scan.min(i + 9); // look up to 8 bytes
+                if i + 1 < window_end {
+                    let window = &b[i + 1..window_end];
+                    let ff_count = window.iter().take_while(|&&x| x == 0xFF).count();
+                    if ff_count >= 3 {
+                        // neutralize: make length = 0
+                        b[i + 1] = 0;
+                    }
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
     }
-    Ok(v)
+    b
 }
 
 impl Arbitrary<'_> for Operation {
