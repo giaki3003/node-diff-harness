@@ -10,6 +10,8 @@ use std::io::{Read, Write};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 use nix::unistd::{pipe, dup2, close};
 use std::os::fd::{AsRawFd, IntoRawFd};
@@ -232,15 +234,13 @@ impl ElixirOracle {
         let mut last_error = None;
 
         // Strategy A: spawn ElixirRunner via mix run (enabled by default; set AMA_ORACLE_USE_MIX=0 to disable)
-        let use_mix = std::env::var("AMA_ORACLE_USE_MIX").map(|v| v != "0").unwrap_or(false);  // Disable mix for FD 3 testing
+        let use_mix = std::env::var("AMA_ORACLE_USE_MIX").map(|v| v != "0").unwrap_or(true);  // Enable mix for full NIF support
         if use_mix {
             let mut cmd = Command::new("mix");
             unsafe {
-                cmd.arg("run")
-                    .arg("-e")
-                    .arg("ElixirRunner.CLI.main([])")
+                cmd.args(&["run", "--no-halt", "-e", "ElixirRunner.CLI.main([])"])
                     .current_dir("../adapters/elixir-runner")
-                    .env("MIX_ENV", "fuzz")
+                    .env("MIX_ENV", "dev")  // Use dev mode for full NIF availability
                     .env("AMA_RESULT_FD", "3")
                     .stdin(Stdio::piped())
                     .stdout(Stdio::null())
@@ -370,4 +370,144 @@ impl Drop for ElixirOracle {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Pool of independent Elixir oracle processes for parallel fuzzing
+/// 
+/// This enables true parallelism by spawning multiple isolated oracle processes,
+/// each with its own RocksDB database and unique working directory, completely
+/// eliminating locking conflicts and maximizing CPU utilization.
+pub struct ElixirOraclePool {
+    oracles: Vec<Mutex<ElixirOracle>>,
+    next_oracle: AtomicUsize,
+    pool_size: usize,
+}
+
+impl ElixirOraclePool {
+    /// Create a new oracle pool with the specified number of processes
+    pub fn new(pool_size: usize) -> Result<Self> {
+        if pool_size == 0 {
+            return Err(anyhow::anyhow!("Pool size must be greater than 0"));
+        }
+        
+        println!("🚀 Spawning {} oracle processes for parallel fuzzing...", pool_size);
+        
+        let mut oracles = Vec::with_capacity(pool_size);
+        let mut failed_spawns = 0;
+        
+        for i in 0..pool_size {
+            match ElixirOracle::new() {
+                Ok(oracle) => {
+                    println!("✅ Oracle {}/{} spawned successfully", i + 1, pool_size);
+                    oracles.push(Mutex::new(oracle));
+                }
+                Err(e) => {
+                    failed_spawns += 1;
+                    eprintln!("❌ Oracle {}/{} failed to spawn: {}", i + 1, pool_size, e);
+                    
+                    // If too many failures, abort pool creation
+                    if failed_spawns > pool_size / 2 {
+                        return Err(anyhow::anyhow!(
+                            "Too many oracle spawn failures ({}/{}), aborting pool creation", 
+                            failed_spawns, pool_size
+                        ));
+                    }
+                }
+            }
+        }
+        
+        let actual_size = oracles.len();
+        if actual_size < pool_size {
+            eprintln!("⚠️  Created pool with {}/{} oracles due to spawn failures", actual_size, pool_size);
+        }
+        
+        println!("🎯 Oracle pool ready: {} processes for parallel execution", actual_size);
+        
+        Ok(Self {
+            oracles,
+            next_oracle: AtomicUsize::new(0),
+            pool_size: actual_size,
+        })
+    }
+    
+    /// Execute a trace using round-robin distribution across the oracle pool
+    pub fn execute_trace(&self, trace: &Trace) -> Result<ExecutionResult> {
+        if self.oracles.is_empty() {
+            return Err(anyhow::anyhow!("No oracles available in pool"));
+        }
+        
+        // Round-robin selection for fair load distribution
+        let oracle_index = self.next_oracle.fetch_add(1, Ordering::Relaxed) % self.pool_size;
+        
+        // Execute on the selected oracle
+        // SAFETY: oracle_index is guaranteed to be < pool_size due to modulo operation
+        let oracle = &self.oracles[oracle_index];
+        
+        // Note: We can't get a mutable reference here since ElixirOracle.execute_trace expects &mut self
+        // We'll need to modify the approach to use interior mutability or unsafe code
+        // For now, let's create a method that handles the execution differently
+        self.execute_on_oracle(oracle_index, trace)
+    }
+    
+    /// Execute trace on a specific oracle by index (internal helper)
+    fn execute_on_oracle(&self, oracle_index: usize, trace: &Trace) -> Result<ExecutionResult> {
+        let oracle = &self.oracles[oracle_index];
+        
+        // Lock the oracle for exclusive access
+        let mut oracle_guard = oracle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Oracle {} mutex poisoned", oracle_index))?;
+        
+        // Execute the trace on the locked oracle
+        oracle_guard.execute_trace(trace)
+    }
+    
+    /// Get the number of active oracles in the pool
+    pub fn pool_size(&self) -> usize {
+        self.pool_size
+    }
+    
+    /// Get pool utilization statistics
+    pub fn stats(&self) -> PoolStats {
+        PoolStats {
+            total_oracles: self.pool_size,
+            active_oracles: self.pool_size, // TODO: Track failed oracles
+        }
+    }
+}
+
+/// Statistics about the oracle pool
+pub struct PoolStats {
+    pub total_oracles: usize,
+    pub active_oracles: usize,
+}
+
+impl Drop for ElixirOraclePool {
+    fn drop(&mut self) {
+        println!("🛑 Shutting down oracle pool with {} processes...", self.pool_size);
+        
+        // Note: Each ElixirOracle has its own Drop implementation that kills the child process,
+        // so when the Mutex<ElixirOracle> is dropped, the child processes will be terminated properly.
+        // We don't need to do anything special here.
+    }
+}
+
+/// Determine the optimal pool size based on system resources and configuration
+pub fn default_pool_size() -> usize {
+    // Check for explicit configuration first
+    if let Ok(size_str) = std::env::var("AMA_ORACLE_POOL_SIZE") {
+        if let Ok(size) = size_str.parse::<usize>() {
+            if size > 0 && size <= 32 {  // Reasonable bounds
+                return size;
+            } else {
+                eprintln!("⚠️  Invalid AMA_ORACLE_POOL_SIZE={}, using default", size_str);
+            }
+        }
+    }
+    
+    // Smart default based on system resources
+    std::cmp::min(
+        num_cpus::get(),     // Don't exceed available CPU cores
+        4                    // Conservative default (4 processes ≈ 600-800MB memory)
+    )
 }

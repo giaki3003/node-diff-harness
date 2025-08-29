@@ -1073,6 +1073,7 @@ dependencies = [
  "hex",
  "libfuzzer-sys",
  "nix",
+ "num_cpus",
  "proto",
  "rust-step",
  "serde_json",

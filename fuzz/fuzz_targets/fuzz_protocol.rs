@@ -9,13 +9,13 @@ use anyhow::{Context, Result};
 use libfuzzer_sys::fuzz_target;
 use proto::{Trace, TraceExecutor};
 use rust_step::RustStepExecutor;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::OnceLock;
 
 mod elixir_oracle;
-use elixir_oracle::ElixirOracle;
+use elixir_oracle::ElixirOraclePool;
 
-/// Global Elixir oracle instance (persistent child process)
-static ELIXIR_ORACLE: OnceLock<Arc<Mutex<ElixirOracle>>> = OnceLock::new();
+/// Global Elixir oracle pool (persistent child processes)
+static ORACLE_POOL: OnceLock<ElixirOraclePool> = OnceLock::new();
 
 fuzz_target!(|trace: Trace| {
     // Initialize tracing (only once)
@@ -28,11 +28,10 @@ fuzz_target!(|trace: Trace| {
 });
 
 fn fuzz_trace(trace: Trace) -> Result<()> {
-    // Get or initialize the Elixir oracle
-    let oracle = ELIXIR_ORACLE.get_or_init(|| {
-        Arc::new(Mutex::new(
-            ElixirOracle::new().expect("Failed to initialize Elixir oracle"),
-        ))
+    // Get or initialize the Elixir oracle pool
+    let pool = ORACLE_POOL.get_or_init(|| {
+        let pool_size = elixir_oracle::default_pool_size();
+        ElixirOraclePool::new(pool_size).expect("Failed to initialize Elixir oracle pool")
     });
 
     // Execute trace on Rust implementation
@@ -43,16 +42,10 @@ fn fuzz_trace(trace: Trace) -> Result<()> {
         .execute_trace(&trace)
         .context("Rust execution failed")?;
 
-    // Execute trace on Elixir implementation
-    let elixir_result = {
-        let mut oracle_guard = oracle
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Oracle mutex poisoned"))?;
-
-        oracle_guard
-            .execute_trace(&trace)
-            .context("Elixir execution failed")?
-    };
+    // Execute trace on Elixir implementation using pool
+    let elixir_result = pool
+        .execute_trace(&trace)
+        .context("Elixir execution failed")?;
 
     // Compare normalized results
     compare_results(&trace, &rust_result, &elixir_result)?;
