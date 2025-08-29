@@ -1,7 +1,25 @@
 # Setup
 setup:
+    #!/usr/bin/env bash
+    echo "🚀 Setting up node-diff-harness..."
+    
+    # Ensure submodules are initialized and updated
+    echo "📦 Initializing git submodules..."
+    git submodule update --init --recursive
+    
+    # Apply critical patches to node submodule
+    echo "🩹 Applying patches to node submodule..."
+    patch -N -p1 -d node < patches/ex_bakeware.patch || true
+    
+    # Build Rust components
+    echo "🦀 Building Rust components..."
     cargo build --all
+    
+    # Build Elixir components
+    echo "⚗️  Building Elixir components..."
     cd adapters/elixir-runner && mix deps.get && CXXFLAGS="-include cstdint" MIX_ENV=prod mix escript.build
+    
+    echo "✅ Setup complete! Run 'just fuzz' to start fuzzing."
 
 # Fuzzing
 fuzz:
@@ -35,6 +53,29 @@ test-all-traces:
 
 rebuild-elixir:
     cd adapters/elixir-runner && CXXFLAGS="-include cstdint" MIX_ENV=prod mix escript.build
+
+# Patch management
+patch-node:
+    #!/usr/bin/env bash
+    echo "🩹 Applying patches to node submodule..."
+    patch -N -p1 -d node < patches/ex_bakeware.patch || true
+    echo "✅ Patches applied successfully"
+
+verify-patches:
+    #!/usr/bin/env bash
+    echo "🔍 Verifying patches are applied..."
+    if grep -q "oracle_mode = System.get_env" node/ex/lib/ex_bakeware.ex; then
+        echo "✅ ex_bakeware.patch is applied"
+    else
+        echo "❌ ex_bakeware.patch NOT applied - run 'just patch-node'"
+        exit 1
+    fi
+
+clean-patches:
+    #!/usr/bin/env bash
+    echo "🧹 Cleaning patches from node submodule..."
+    cd node && git checkout -- ex/lib/ex_bakeware.ex || true
+    echo "✅ Patches cleaned - node submodule restored to original state"
 
 # Advanced fuzzing
 fuzz-intensive:

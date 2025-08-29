@@ -1,0 +1,30 @@
+diff --git a/ex/lib/ex_bakeware.ex b/ex/lib/ex_bakeware.ex
+index 09c2d00..d03bd14 100644
+--- a/ex/lib/ex_bakeware.ex
++++ b/ex/lib/ex_bakeware.ex
+@@ -48,9 +48,22 @@ defmodule Ama.Bakeware do
+             :erlang.halt()
+ 
+           true ->
+-            Ama.start(nil, [])
+-            receive do end
+-            0
++            # Check if we're in oracle mode to avoid duplicate initialization
++            oracle_mode = System.get_env("AMA_RESULT_FD") != nil
++            
++            if oracle_mode do
++              IO.puts(:stderr, "[DEBUG] BAKEWARE.MAIN CALLED IN ORACLE MODE - SKIPPING Ama.start to prevent RocksDB conflicts")
++              # In oracle mode, the ElixirRunner.CLI already handles initialization
++              # Just wait indefinitely to avoid calling Ama.start which would create RocksDB lock conflicts
++              # The actual oracle work is handled by ElixirRunner.CLI
++              receive do end
++              0
++            else
++              IO.puts(:stderr, "[DEBUG] BAKEWARE.MAIN CALLED in normal mode with args: #{inspect(args)}")
++              Ama.start(nil, [])
++              receive do end
++              0
++            end
+         end
+     end
+ end

@@ -24,11 +24,13 @@ libfuzzer → Arbitrary → JSON Trace → Rust Executor (rs_node)    → SHA256
 ## Setup
 
 ```bash
-just setup     # installs cargo-fuzz, builds everything
+just setup     # initializes submodules, applies patches, builds everything
 just fuzz      # start fuzzing
 ```
 
-Requires: Rust, Elixir/OTP, just, C compiler
+Requires: Rust, Elixir/OTP, just, C compiler, git
+
+**Note**: Setup automatically applies required patches to the node submodule - see [Node Patches](#node-patches) section below.
 
 ## How it works
 
@@ -44,6 +46,11 @@ just fuzz                    # unlimited fuzzing
 just fuzz-quick             # 30-second test
 just replay [trace.json]    # debug specific trace
 just test-all-traces        # smoke test curated traces
+
+# Patch management
+just patch-node             # manually apply patches to node submodule
+just verify-patches         # check if patches are applied correctly
+just clean-patches          # restore node submodule to original state
 ```
 
 ## Trace format
@@ -62,9 +69,46 @@ JSON with seed and operation list:
 
 Operations: `Ping`, `TxPool`, `Peers`/`PeersV2`, `ProcessTx`
 
-## Status
+## Node Patches
 
-**Found bugs**: Zero-parameter Ping digest mismatch, protocol version incompatibilities
+The fuzzer requires a single critical patch to the Elixir node submodule to prevent RocksDB lock conflicts during parallel oracle execution:
+
+**File**: `node/ex/lib/ex_bakeware.ex`
+**Purpose**: Oracle mode detection to avoid duplicate `Ama.start/2` calls
+**Patch**: `patches/ex_bakeware.patch`
+
+### What the patch does
+
+The patch adds oracle mode detection using the `AMA_RESULT_FD` environment variable:
+
+```elixir
+# Check if we're in oracle mode to avoid duplicate initialization
+oracle_mode = System.get_env("AMA_RESULT_FD") != nil
+
+if oracle_mode do
+  # Skip Ama.start/2 to prevent RocksDB lock conflicts
+  # ElixirRunner.CLI handles all initialization
+  receive do end
+else
+  # Normal mode - start application normally
+  Ama.start(nil, [])
+  receive do end
+end
+```
+
+### Patch management
+
+- **Automatic**: `just setup` applies patches automatically
+- **Manual**: `just patch-node` to apply patches manually
+- **Verify**: `just verify-patches` to check patch status
+- **Clean**: `just clean-patches` to restore original files
+
+## Status
+The fuzzer currently works and will start fuzzing the following operations:
+- Ping
+- TxPool
+- ProcessTx
+
 **Known TODOs**: PeersV2 support in Rust implementation
 
 ## Directory structure
@@ -77,5 +121,6 @@ replay/          # CLI debugging tool
 test-traces/     # curated test cases
 rs_node/         # rust implementation (submodule)
 node/            # elixir implementation (submodule)
+patches/         # patches for node submodule
 ```
 
