@@ -40,7 +40,7 @@ defmodule ElixirRunner.Normalizer do
           %{type: :transaction, validation_result: code} ->
             acc <>
               "tx:" <>
-              <<code::64-little>>
+              <<code::32-little>>
 
           %{type: :serialization, success: success} ->
             acc <>

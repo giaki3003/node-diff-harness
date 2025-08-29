@@ -71,6 +71,60 @@ impl ExecutionResult {
     }
 }
 
+/// Canonical error taxonomy for consistent cross-implementation error classification
+/// 
+/// This enum defines semantic error categories that both Rust and Elixir implementations
+/// can map their native errors to, enabling meaningful differential testing comparison.
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CanonErr {
+    /// Successful operation
+    Ok           = 1,
+    /// Resource limits exceeded (size, memory, etc.)
+    TooLarge     = 122,
+    /// Generic parsing/deserialization failure (VanillaSer, ETF, etc.)
+    Decode       = 123,
+    /// Unexpected EOF or insufficient data
+    Truncated    = 124,
+    /// Integer/varint overflow
+    Overflow     = 125,
+    /// Negative length or invalid sign bit
+    NegativeLen  = 126,
+    /// Container nesting exceeded limits
+    DepthExceeded = 127,
+    /// Unrecognized type tag or format
+    UnknownTag   = 128,
+}
+
+impl From<CanonErr> for u32 {
+    fn from(c: CanonErr) -> u32 {
+        c as u32
+    }
+}
+
+impl From<CanonErr> for u16 {
+    fn from(c: CanonErr) -> u16 {
+        c as u16
+    }
+}
+
+impl CanonErr {
+    /// Get the canonical error code as u32 (for compatibility with existing adapters)
+    pub fn code(self) -> u32 {
+        self.into()
+    }
+
+    /// Check if this represents a successful operation
+    pub fn is_success(self) -> bool {
+        matches!(self, CanonErr::Ok)
+    }
+
+    /// Check if this represents a failure
+    pub fn is_error(self) -> bool {
+        !self.is_success()
+    }
+}
+
 /// Trait for implementations that can execute traces
 pub trait TraceExecutor {
     type Error;
