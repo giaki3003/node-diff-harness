@@ -157,23 +157,26 @@ impl ElixirRunner {
         let (read_fd, write_fd) = pipe().context("Failed to create pipe for FD 3")?;
         let write_raw = write_fd.as_raw_fd();
 
-        // Try to find the Elixir runner escript
-        let possible_paths = [
-            "./adapters/elixir-runner/elixir_runner",
-            "../adapters/elixir-runner/elixir_runner",
-            "../../adapters/elixir-runner/elixir_runner",
-            "./elixir_runner",
+        // Use mix run instead of escript for full NIF support
+        let possible_dirs = [
+            "./adapters/elixir-runner/",
+            "../adapters/elixir-runner/",
+            "../../adapters/elixir-runner/",
+            "./",
         ];
 
         let mut last_error = None;
 
-        for path in &possible_paths {
-            let mut cmd = Command::new(path);
+        for dir in &possible_dirs {
+            let mut cmd = Command::new("mix");
             unsafe {
-                cmd.env("AMA_RESULT_FD", "3")
+                cmd.args(&["run", "--no-halt", "-e", "ElixirRunner.CLI.main([])"])
+                    .current_dir(dir)
+                    .env("AMA_RESULT_FD", "3")
+                    .env("MIX_ENV", "dev")  // Use dev mode for full NIF availability
                     .stdin(Stdio::piped())
                     .stdout(Stdio::null())   // logs won't matter now
-                    .stderr(Stdio::null())   // or inherit if you want to see them
+                    .stderr(Stdio::inherit())   // Enable to see mix output for debugging
                     .pre_exec(move || {
                         // SAFETY: we are in the child just before exec
                         // make write_raw become FD 3
@@ -188,7 +191,7 @@ impl ElixirRunner {
 
             match cmd.spawn() {
                 Ok(child) => {
-                    println!("✅ Started Elixir oracle: {}", path);
+                    println!("✅ Started Elixir oracle: mix run in {}", dir);
 
                     // Close the write end in the parent process (consume the OwnedFd)
                     drop(write_fd);
@@ -214,8 +217,8 @@ impl ElixirRunner {
         drop(write_fd);
 
         Err(anyhow::anyhow!(
-            "Could not find Elixir runner. Tried paths: {:?}. Last error: {:?}",
-            possible_paths,
+            "Could not start Elixir runner. Tried dirs: {:?}. Last error: {:?}",
+            possible_dirs,
             last_error
         ))
     }
