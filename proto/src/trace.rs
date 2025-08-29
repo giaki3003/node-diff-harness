@@ -97,10 +97,26 @@ impl Arbitrary<'_> for Trace {
     }
 }
 
+/// Generate reasonable transaction bytes that avoid obviously impossible varint patterns
+fn reasonable_tx_bytes(u: &mut Unstructured<'_>, max: usize) -> Result<Vec<u8>> {
+    let n = u.int_in_range(32..=std::cmp::min(max, 8192))?; // plenty big, not insane
+    let mut v = vec![0u8; n];
+    for b in &mut v { 
+        *b = u.arbitrary()?; 
+    }
+    // Nudge away from malicious varint prefixes:
+    if n >= 8 && matches!(v[0], 5|6|7) && v[1] > 3 { 
+        v[1] = 3; // cap magnitude length
+    }
+    Ok(v)
+}
+
 impl Arbitrary<'_> for Operation {
     fn arbitrary(u: &mut Unstructured<'_>) -> Result<Self> {
-        match u.int_in_range(0..=3)? {
-            0 => Ok(Operation::Ping {
+        // Rebalance Operation weights to bias towards ops that grow coverage:
+        // Ping: 30%, TxPool: 40%, ProcessTx: 25%, SerializeMessage: 5%
+        match u.int_in_range(0..=99)? {
+            0..=29 => Ok(Operation::Ping {
                 // Realistic chain heights (avoid zero which can crash oracle)
                 temporal_height: u.int_in_range(1..=1_000_000)?,
                 temporal_slot: u.int_in_range(1..=10_000)?,
@@ -110,16 +126,13 @@ impl Arbitrary<'_> for Operation {
                 timestamp_ms: u.int_in_range(1_600_000_000_000..=1_900_000_000_000)?,
             }),
 
-            1 => {
+            30..=69 => {
                 // TxPool: Realistic batching (1-50 transactions per UDP message)
                 let num_txs = u.int_in_range(1..=MAX_TXS)?;
                 let mut txs = Vec::with_capacity(num_txs);
                 for _ in 0..num_txs {
-                    // Realistic transaction sizes (32 bytes minimum for basic tx)
-                    let tx_size = u.int_in_range(32..=MAX_TX_SIZE)?;
-                    let tx_data: Vec<u8> = (0..tx_size)
-                        .map(|_| u.arbitrary())
-                        .collect::<Result<Vec<_>>>()?;
+                    // Use reasonable_tx_bytes helper to avoid malformed varint patterns
+                    let tx_data = reasonable_tx_bytes(u, MAX_TX_SIZE)?;
                     txs.push(tx_data);
                 }
                 Ok(Operation::TxPool { txs })
@@ -143,29 +156,31 @@ impl Arbitrary<'_> for Operation {
             //     Ok(Operation::PeersV2 { anrs })
             // }
 
-            2 => {
+            70..=94 => {
                 // ProcessTx: Single transaction processing
-                let tx_size = u.int_in_range(32..=MAX_TX_SIZE)?; // Minimum 32 bytes
-                let tx_data: Vec<u8> = (0..tx_size)
-                    .map(|_| u.arbitrary())
-                    .collect::<Result<Vec<_>>>()?;
+                // Use reasonable_tx_bytes helper to avoid malformed varint patterns
+                let tx_data = reasonable_tx_bytes(u, MAX_TX_SIZE)?;
                 Ok(Operation::ProcessTx {
                     tx_data,
                     is_special_meeting: u.arbitrary()?,
                 })
             }
 
-            3 => {
+            _ => {
                 // SerializeMessage: Single message serialization test
                 let msg_type = u.arbitrary::<MessageType>()?;
-                let payload_size = u.int_in_range(0..=1000)?;
+                
+                // Constraint: Ping messages cannot have empty payloads as they cannot be deserialized
+                let payload_size = match msg_type {
+                    MessageType::Ping => u.int_in_range(1..=1000)?, // Minimum 1 byte for Ping
+                    _ => u.int_in_range(0..=1000)?, // Others can be empty
+                };
+                
                 let payload: Vec<u8> = (0..payload_size)
                     .map(|_| u.arbitrary())
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Operation::SerializeMessage { msg_type, payload })
             }
-
-            _ => unreachable!(),
         }
     }
 }

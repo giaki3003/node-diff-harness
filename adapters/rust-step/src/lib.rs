@@ -5,7 +5,7 @@
 //! the Elixir implementation.
 
 use anyhow::Result;
-use proto::{ExecutionMetrics, ExecutionResult, Operation, Trace, TraceExecutor};
+use proto::{ExecutionMetrics, ExecutionResult, Operation, Trace, TraceExecutor, MessageType};
 use rand::SeedableRng;
 use sha2::{Digest, Sha256};
 use std::time::Instant;
@@ -108,17 +108,27 @@ impl RustStepExecutor {
             }
 
             Operation::SerializeMessage { msg_type, payload } => {
-                let result = self
-                    .protocol_adapter
-                    .test_serialization(msg_type, payload)?;
-                Ok(OperationResult::Serialization { success: result })
+                // Exclude empty Ping serialization from affecting the digest (mirror Elixir)
+                if matches!(msg_type, MessageType::Ping) && payload.is_empty() {
+                    Ok(OperationResult::Noop)
+                } else {
+                    let result = self
+                        .protocol_adapter
+                        .test_serialization(msg_type, payload)?;
+                    Ok(OperationResult::Serialization { success: result })
+                }
             }
         }
     }
 
     /// Compute normalized digest from operation results
     fn compute_digest(&self, results: &[OperationResult]) -> Vec<u8> {
-        let mut hasher = Sha256::new();
+        // Build the exact byte stream we will hash so we can debug it if needed
+        let debug_enabled = std::env::var("FUZZ_DEBUG")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        let mut input_bytes: Vec<u8> = Vec::new();
 
         for result in results {
             match result {
@@ -126,22 +136,37 @@ impl RustStepExecutor {
                     data,
                     messages_count,
                 } => {
-                    hasher.update(b"protocol:");
-                    hasher.update(&messages_count.to_le_bytes());
-                    hasher.update(data);
+                    input_bytes.extend_from_slice(b"protocol:");
+                    input_bytes.extend_from_slice(&messages_count.to_le_bytes());
+                    input_bytes.extend_from_slice(data);
                 }
                 OperationResult::Transaction { validation_result } => {
-                    hasher.update(b"tx:");
-                    hasher.update(&validation_result.to_le_bytes());
+                    input_bytes.extend_from_slice(b"tx:");
+                    input_bytes.extend_from_slice(&validation_result.to_le_bytes());
                 }
                 OperationResult::Serialization { success } => {
-                    hasher.update(b"serialize:");
-                    hasher.update(&[if *success { 1u8 } else { 0u8 }]);
+                    input_bytes.extend_from_slice(b"serialize:");
+                    input_bytes.push(if *success { 1u8 } else { 0u8 });
+                }
+                OperationResult::Noop => {
+                    // Intentionally omitted from digest
                 }
             }
         }
 
-        hasher.finalize().to_vec()
+        if debug_enabled {
+            eprintln!("[RUST] Trace digest input bytes: {:?}", &input_bytes);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(&input_bytes);
+        let digest = hasher.finalize().to_vec();
+
+        if debug_enabled {
+            eprintln!("[RUST] Final trace digest bytes: {:?}", &digest);
+        }
+
+        digest
     }
 }
 
@@ -170,6 +195,7 @@ impl TraceExecutor for RustStepExecutor {
         for op in &trace.ops {
             match self.execute_operation(op) {
                 Ok(result) => {
+                    // Update metrics based on non-noop results
                     match &result {
                         OperationResult::Protocol { messages_count, .. } => {
                             messages_processed += messages_count;
@@ -177,10 +203,16 @@ impl TraceExecutor for RustStepExecutor {
                         OperationResult::Transaction { .. } => {
                             transactions_processed += 1;
                         }
+                        OperationResult::Noop => {
+                            // skip metrics and ops count
+                        }
                         _ => {}
                     }
+                    let is_noop = matches!(result, OperationResult::Noop);
                     results.push(result);
-                    ops_executed += 1;
+                    if !is_noop {
+                        ops_executed += 1;
+                    }
                 }
                 Err(e) => {
                     // Log error but continue execution for partial results
@@ -227,6 +259,7 @@ enum OperationResult {
     Serialization {
         success: bool,
     },
+    Noop,
 }
 
 #[cfg(test)]

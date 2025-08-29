@@ -50,18 +50,13 @@ defmodule ElixirRunner.TraceExecutor do
   """
   def execute(executor, trace) do
     try do
-      
-      # Set deterministic seed for reproducible results
       :rand.seed(:exsss, {trace.seed, trace.seed + 1, trace.seed + 2})
       
       updated_executor = %{executor | seed: trace.seed}
       
-      # Time the execution
       {duration_us, result} = :timer.tc(fn ->
         execute_operations(updated_executor, trace.ops, [])
       end)
-      
-      # Add timing to result
       case result do
         {:ok, result_map} ->
           updated_metrics = %{result_map.metrics | duration_us: duration_us}
@@ -78,8 +73,6 @@ defmodule ElixirRunner.TraceExecutor do
   end
 
   defp execute_operations(executor, [], results) do
-    # All operations completed successfully
-    
     digest = Normalizer.compute_digest(executor.normalizer, results)
     
     {:ok, %{
@@ -87,7 +80,7 @@ defmodule ElixirRunner.TraceExecutor do
       ops_executed: length(results),
       error: nil,
       metrics: %{
-        duration_us: 0, # Not implemented yet
+        duration_us: 0,
         memory_bytes: nil,
         messages_processed: count_messages(results),
         transactions_processed: count_transactions(results)
@@ -96,25 +89,28 @@ defmodule ElixirRunner.TraceExecutor do
   end
 
   defp execute_operations(executor, [op | remaining_ops], results) do
-    
     case execute_single_operation(executor, op) do
+      {:ok, %{type: :noop}} ->
+        execute_operations(executor, remaining_ops, results)
+
       {:ok, result} ->
         execute_operations(executor, remaining_ops, [result | results])
+
       {:error, reason} ->
-        # Return partial results with error
         digest = Normalizer.compute_digest(executor.normalizer, results)
-        
-        {:ok, %{
-          digest: digest,
-          ops_executed: length(results),
-          error: reason,
-          metrics: %{
-            duration_us: 0,
-            memory_bytes: nil,
-            messages_processed: count_messages(results),
-            transactions_processed: count_transactions(results)
-          }
-        }}
+
+        {:ok,
+         %{
+           digest: digest,
+           ops_executed: length(results),
+           error: reason,
+           metrics: %{
+             duration_us: 0,
+             memory_bytes: nil,
+             messages_processed: count_messages(results),
+             transactions_processed: count_transactions(results)
+           }
+         }}
     end
   end
 
@@ -139,7 +135,21 @@ defmodule ElixirRunner.TraceExecutor do
   end
 
   defp execute_single_operation(executor, %{type: :serialize_message} = op) do
-    ProtocolAdapter.test_serialization(executor.protocol_adapter, op)
+    msg_type = Map.get(op, :msg_type)
+    payload = Map.get(op, :payload, [])
+
+    is_empty =
+      cond do
+        is_list(payload) and payload == [] -> true
+        is_binary(payload) and byte_size(payload) == 0 -> true
+        true -> false
+      end
+
+    if is_empty and msg_type in [:ping, "Ping"] do
+      {:ok, %{type: :noop}}
+    else
+      ProtocolAdapter.test_serialization(executor.protocol_adapter, op)
+    end
   end
 
   defp execute_single_operation(_executor, %{type: :unknown}) do

@@ -2104,6 +2104,7 @@ dependencies = [
  "clap",
  "colored",
  "hex",
+ "nix",
  "proto",
  "rust-step",
  "serde_json",
@@ -2167,6 +2168,7 @@ dependencies = [
  "ama_core",
  "anyhow",
  "eetf",
+ "hex",
  "proto",
  "rand",
  "rand_chacha",
@@ -2534,8 +2536,10 @@ name = "test-utils"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
  "proto",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

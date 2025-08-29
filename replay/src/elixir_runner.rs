@@ -5,22 +5,28 @@
 
 use anyhow::{Context, Result};
 use proto::{ExecutionResult, Trace};
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::process::CommandExt;
 use std::process::Stdio;
+use tokio::fs::File as TokioFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::time::{timeout, Duration};
+use nix::unistd::{pipe, dup2, close};
+use std::os::fd::{AsRawFd, IntoRawFd};
 
 pub struct ElixirRunner {
     child: Child,
+    result_reader: TokioFile, // NEW: read replies from FD 3 pipe
 }
 
 impl ElixirRunner {
     pub async fn new() -> Result<Self> {
-        let child = Self::spawn_elixir_process()
+        let (child, result_reader) = Self::spawn_elixir_process()
             .await
             .context("Failed to spawn Elixir process")?;
 
-        Ok(Self { child })
+        Ok(Self { child, result_reader })
     }
 
     pub async fn execute_trace(&mut self, trace: &Trace) -> Result<ExecutionResult> {
@@ -53,31 +59,27 @@ impl ElixirRunner {
     }
 
     async fn read_response(&mut self) -> Result<Vec<u8>> {
-        if let Some(stdout) = &mut self.child.stdout {
-            // Read length
-            let mut length_buf = [0u8; 4];
-            stdout
-                .read_exact(&mut length_buf)
-                .await
-                .context("Failed to read response length")?;
+        // Read length from FD 3 pipe
+        let mut length_buf = [0u8; 4];
+        self.result_reader
+            .read_exact(&mut length_buf)
+            .await
+            .context("Failed to read response length from FD 3")?;
 
-            let response_length = u32::from_be_bytes(length_buf);
+        let response_length = u32::from_be_bytes(length_buf);
 
-            if response_length == 0 {
-                return Ok(vec![]); // Error response
-            }
-
-            // Read response data
-            let mut response_buf = vec![0u8; response_length as usize];
-            stdout
-                .read_exact(&mut response_buf)
-                .await
-                .context("Failed to read response data")?;
-
-            Ok(response_buf)
-        } else {
-            anyhow::bail!("Elixir process has no stdout");
+        if response_length == 0 {
+            return Ok(vec![]); // Error response
         }
+
+        // Read response data from FD 3 pipe
+        let mut response_buf = vec![0u8; response_length as usize];
+        self.result_reader
+            .read_exact(&mut response_buf)
+            .await
+            .context("Failed to read response data from FD 3")?;
+
+        Ok(response_buf)
     }
 
     fn parse_response(&self, response: &[u8]) -> Result<ExecutionResult> {
@@ -150,7 +152,11 @@ impl ElixirRunner {
         Ok(result)
     }
 
-    async fn spawn_elixir_process() -> Result<Child> {
+    async fn spawn_elixir_process() -> Result<(Child, TokioFile)> {
+        // Create a pipe for FD 3 communication
+        let (read_fd, write_fd) = pipe().context("Failed to create pipe for FD 3")?;
+        let write_raw = write_fd.as_raw_fd();
+
         // Try to find the Elixir runner escript
         let possible_paths = [
             "./adapters/elixir-runner/elixir_runner",
@@ -162,22 +168,39 @@ impl ElixirRunner {
         let mut last_error = None;
 
         for path in &possible_paths {
-            match Command::new(path)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .env("LC_ALL", "C")         // Force C locale for binary I/O
-                .env("LANG", "C")           // Force C language for binary I/O  
-                .env("ERL_AFLAGS", "-noshell +A4 +K true") // Elixir/Erlang flags for binary I/O
-                .spawn()
-            {
+            let mut cmd = Command::new(path);
+            unsafe {
+                cmd.env("AMA_RESULT_FD", "3")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())   // logs won't matter now
+                    .stderr(Stdio::null())   // or inherit if you want to see them
+                    .pre_exec(move || {
+                        // SAFETY: we are in the child just before exec
+                        // make write_raw become FD 3
+                        match dup2(write_raw, 3) {
+                            Ok(_) => {},
+                            Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32)),
+                        }
+                        let _ = close(write_raw);
+                        Ok(())
+                    })
+            };
+
+            match cmd.spawn() {
                 Ok(child) => {
                     println!("✅ Started Elixir oracle: {}", path);
+
+                    // Close the write end in the parent process (consume the OwnedFd)
+                    drop(write_fd);
+
+                    // Convert read_fd to a TokioFile
+                    let reader = unsafe { std::fs::File::from_raw_fd(read_fd.into_raw_fd()) };
+                    let result_reader = TokioFile::from_std(reader);
 
                     // Give it a moment to start
                     tokio::time::sleep(Duration::from_millis(200)).await;
 
-                    return Ok(child);
+                    return Ok((child, result_reader));
                 }
                 Err(e) => {
                     last_error = Some(e);
@@ -185,6 +208,10 @@ impl ElixirRunner {
                 }
             }
         }
+
+        // If we get here, all paths failed - clean up the pipe (consume the OwnedFds)
+        drop(read_fd);
+        drop(write_fd);
 
         Err(anyhow::anyhow!(
             "Could not find Elixir runner. Tried paths: {:?}. Last error: {:?}",

@@ -39,7 +39,8 @@ defmodule ElixirRunner.MixProject do
     [
       main_module: ElixirRunner.CLI,
       name: "elixir_runner",
-      embed_elixir: true
+      embed_elixir: true,
+      erl_opts: ["+fnu", "+pc", "unicode"]
     ]
   end
 end

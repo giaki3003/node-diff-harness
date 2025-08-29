@@ -9,6 +9,7 @@ use ama_core::node::protocol;
 use anyhow::Result;
 use proto::MessageType;
 use sha2::{Digest, Sha256};
+use crate::tx_adapter::TxAdapter;
 
 // Protocol prefix constants for canonical digest creation
 const PROTOCOL_PING: &[u8] = b"ping";
@@ -19,14 +20,17 @@ const PROTOCOL_PEERS: &[u8] = b"peers";
 pub struct ProtocolAdapter {
     // State for consistent mock data generation
     mock_signer: [u8; 48],
+    // Protected transaction validator
+    tx_adapter: TxAdapter,
 }
 
 impl ProtocolAdapter {
     pub fn new() -> Result<Self> {
         // Use a fixed mock signer for deterministic results
         let mock_signer = [0x42u8; 48];
+        let tx_adapter = TxAdapter::new()?;
 
-        Ok(Self { mock_signer })
+        Ok(Self { mock_signer, tx_adapter })
     }
 
     /// Handle ping message creation and return canonical digest
@@ -140,29 +144,66 @@ impl ProtocolAdapter {
     ) -> Result<Vec<u8>> {
         // Create canonical representation: ("ping", rooted_height, rooted_slot, temporal_height, temporal_slot, timestamp_ms)
         // Order fields alphabetically by field name for determinism
-        let mut hasher = Sha256::new();
-        hasher.update(PROTOCOL_PING);
-        hasher.update(&rooted_height.to_le_bytes());
-        hasher.update(&rooted_slot.to_le_bytes());
-        hasher.update(&temporal_height.to_le_bytes());
-        hasher.update(&temporal_slot.to_le_bytes());
-        hasher.update(&timestamp_ms.to_le_bytes());
+        // Build the exact byte sequence we hash to make debugging easy
+        let mut bytes = Vec::with_capacity(4 + 8 * 5);
+        bytes.extend_from_slice(PROTOCOL_PING);
+        bytes.extend_from_slice(&rooted_height.to_le_bytes());
+        bytes.extend_from_slice(&rooted_slot.to_le_bytes());
+        bytes.extend_from_slice(&temporal_height.to_le_bytes());
+        bytes.extend_from_slice(&temporal_slot.to_le_bytes());
+        bytes.extend_from_slice(&timestamp_ms.to_le_bytes());
 
-        Ok(hasher.finalize().to_vec())
+        // Optional debugging: print the exact bytes and digest when FUZZ_DEBUG=1
+        let debug_enabled = std::env::var("FUZZ_DEBUG")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if debug_enabled {
+            eprintln!(
+                "[RUST] Ping hash input hex: {}",
+                hex::encode(&bytes)
+            );
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let digest = hasher.finalize().to_vec();
+
+        if debug_enabled {
+            eprintln!(
+                "[RUST] Ping digest hex: {}",
+                hex::encode(&digest)
+            );
+        }
+
+        Ok(digest)
     }
 
-    /// Create canonical digest for TxPool message
-    fn create_txpool_canonical_digest(&self, txs: &[Vec<u8>]) -> Result<Vec<u8>> {
-        // Create canonical representation: ("txpool", sorted_tx_hashes)
+    /// Create canonical digest for TxPool message with prevalidation filter
+    fn create_txpool_canonical_digest(&mut self, txs: &[Vec<u8>]) -> Result<Vec<u8>> {
+        // Create canonical representation: ("txpool", sorted_valid_txs)
         let mut hasher = Sha256::new();
         hasher.update(PROTOCOL_TXPOOL);
 
-        // Sort transactions for deterministic ordering
-        let mut sorted_txs = txs.to_vec();
-        sorted_txs.sort();
+        // Filter only transactions that pass protected tx validation
+        let mut valid_txs: Vec<Vec<u8>> = Vec::with_capacity(txs.len());
+        for tx_bytes in txs {
+            // Use protected transaction validation that guards against malicious varints
+            match self.tx_adapter.validate_transaction(tx_bytes, false) {
+                Ok(1) => {
+                    // Valid transaction (code 1 means success)
+                    valid_txs.push(tx_bytes.clone());
+                }
+                Ok(_) | Err(_) => {
+                    // Invalid transaction or error - skip it
+                }
+            }
+        }
 
-        // Hash each transaction in sorted order
-        for tx in &sorted_txs {
+        // Sort valid transactions for deterministic ordering
+        valid_txs.sort();
+
+        // Hash each valid transaction in sorted order
+        for tx in &valid_txs {
             hasher.update(tx);
         }
 
@@ -270,5 +311,95 @@ mod tests {
         assert_ne!(ping_digest, txpool_digest);
         assert_ne!(ping_digest, peers_digest);
         assert_ne!(txpool_digest, peers_digest);
+    }
+
+    #[test]
+    fn test_txpool_excludes_invalid_zero() {
+        let mut adapter = ProtocolAdapter::new().unwrap();
+
+        // A clearly invalid tx (all zeros) should be filtered out
+        let zero_tx = vec![0u8; 64];
+        let digest = adapter.handle_txpool(&[zero_tx]).unwrap();
+
+        // Expected digest is SHA256 over just the "txpool" prefix, since no valid tx remains
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"txpool");
+        let expected = hasher.finalize().to_vec();
+
+        assert_eq!(digest, expected);
+    }
+
+    #[test]
+    fn test_debug_ping_bytes() {
+        let mut adapter = ProtocolAdapter::new().unwrap();
+        
+        // Test the exact failing case from fuzzer
+        let temporal_height = 1u64;
+        let temporal_slot = 1u64;
+        let rooted_height = 1u64;
+        let rooted_slot = 1u64;
+        let timestamp_ms = 1600000000000u64;
+        
+        // Manually build what should be hashed
+        let mut debug_bytes = Vec::new();
+        debug_bytes.extend_from_slice(PROTOCOL_PING);
+        debug_bytes.extend_from_slice(&rooted_height.to_le_bytes());
+        debug_bytes.extend_from_slice(&rooted_slot.to_le_bytes());
+        debug_bytes.extend_from_slice(&temporal_height.to_le_bytes());
+        debug_bytes.extend_from_slice(&temporal_slot.to_le_bytes());
+        debug_bytes.extend_from_slice(&timestamp_ms.to_le_bytes());
+        
+        println!("Debug: Rust ping hash input bytes: {:?}", debug_bytes);
+        println!("Debug: Rust ping hash input hex: {}", hex::encode(&debug_bytes));
+        
+        // Compute expected hash manually
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&debug_bytes);
+        let expected_digest = hasher.finalize().to_vec();
+        println!("Debug: Expected Rust digest: {}", hex::encode(&expected_digest));
+        
+        // Test actual function
+        let result = adapter.handle_ping(temporal_height, temporal_slot, rooted_height, rooted_slot, timestamp_ms).unwrap();
+        println!("Debug: Actual Rust digest: {}", hex::encode(&result));
+        
+        assert_eq!(result, expected_digest);
+    }
+
+    #[test]
+    fn test_debug_trace_digest() {
+        let mut adapter = ProtocolAdapter::new().unwrap();
+        
+        // Test the exact failing case from fuzzer
+        let temporal_height = 1u64;
+        let temporal_slot = 1u64;
+        let rooted_height = 1u64;
+        let rooted_slot = 1u64;
+        let timestamp_ms = 1600000000000u64;
+        
+        // Get the ping digest
+        let ping_digest = adapter.handle_ping(temporal_height, temporal_slot, rooted_height, rooted_slot, timestamp_ms).unwrap();
+        println!("Debug: Ping digest: {}", hex::encode(&ping_digest));
+        
+        // Now compute the overall trace digest as the trace execution would
+        let messages_count = 1u32;
+        let mut trace_digest_bytes = Vec::new();
+        trace_digest_bytes.extend_from_slice(b"protocol:");
+        trace_digest_bytes.extend_from_slice(&messages_count.to_le_bytes());
+        trace_digest_bytes.extend_from_slice(&ping_digest);
+        
+        println!("Debug: Trace digest input bytes: {:?}", trace_digest_bytes);
+        println!("Debug: Trace digest input hex: {}", hex::encode(&trace_digest_bytes));
+        
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&trace_digest_bytes);
+        let trace_digest = hasher.finalize().to_vec();
+        println!("Debug: Final trace digest: {}", hex::encode(&trace_digest));
+        
+        // This should match what the replay tool produces
+        let expected_replay_digest = hex::decode("ced85bc10b1fb74b0ea7df00ae9effda1daeba1c45eff568e7787463a09b4da1").unwrap();
+        assert_eq!(trace_digest, expected_replay_digest);
     }
 }

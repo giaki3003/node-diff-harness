@@ -6,11 +6,10 @@ defmodule ElixirRunner.ProtocolAdapter do
   Elixir node to create and process protocol messages.
   """
 
-  # Protocol prefix constants for canonical digest creation
-  @protocol_ping <<112, 105, 110, 103>>  # "ping"
-  @protocol_txpool <<116, 120, 112, 111, 111, 108>>  # "txpool"
-  @protocol_peers <<112, 101, 101, 114, 115>>  # "peers"
-  @protocol_peers_v2 <<112, 101, 101, 114, 115, 95, 118, 50>>  # "peers_v2"
+  @protocol_ping <<112, 105, 110, 103>>
+  @protocol_txpool <<116, 120, 112, 111, 111, 108>>
+  @protocol_peers <<112, 101, 101, 114, 115>>
+  @protocol_peers_v2 <<112, 101, 101, 114, 115, 95, 118, 50>>
 
   defstruct [
     :mock_signer
@@ -24,7 +23,6 @@ defmodule ElixirRunner.ProtocolAdapter do
   Initialize the protocol adapter.
   """
   def init do
-    # Use a fixed mock signer for deterministic results
     mock_signer = :binary.copy(<<0x42>>, 48)
     
     {:ok, %__MODULE__{
@@ -43,7 +41,6 @@ defmodule ElixirRunner.ProtocolAdapter do
     timestamp_ms: timestamp_ms
   }) do
     try do
-      # Create canonical digest matching Rust format
       digest = create_ping_canonical_digest(
         temporal_height,
         temporal_slot,
@@ -68,14 +65,15 @@ defmodule ElixirRunner.ProtocolAdapter do
   """
   def handle_txpool(_adapter, %{txs: txs}) do
     try do
-      # Create canonical digest matching Rust format
-      digest = create_txpool_canonical_digest(txs)
+      {digest, included_count, filtered_count} = create_txpool_canonical_digest(txs)
       
       {:ok, %{
         type: :protocol,
         operation: :txpool,
         data: digest,
         tx_count: length(txs),
+        included_tx_count: included_count,
+        filtered_tx_count: filtered_count,
         messages_count: 1
       }}
     rescue
@@ -88,7 +86,6 @@ defmodule ElixirRunner.ProtocolAdapter do
   """
   def handle_peers(_adapter, %{ips: ips}) do
     try do
-      # Create canonical digest matching Rust format
       digest = create_peers_canonical_digest(ips)
       
       {:ok, %{
@@ -109,10 +106,6 @@ defmodule ElixirRunner.ProtocolAdapter do
   """
   def handle_peers_v2(_adapter, %{anrs: anrs}) do
     try do
-      # Convert simplified ANR format to actual node format
-      # For now, treat ANRs as IP strings until full ANR parsing is implemented
-      
-      # Create canonical digest for PeersV2 message
       digest = create_peers_v2_canonical_digest(anrs)
       
       {:ok, %{
@@ -150,90 +143,114 @@ defmodule ElixirRunner.ProtocolAdapter do
     end
   end
 
-  # Create canonical digest for Ping message (matching Rust format)
   defp create_ping_canonical_digest(temporal_height, temporal_slot, rooted_height, rooted_slot, timestamp_ms) do
-    # Use incremental hashing exactly like Rust implementation
-    digest = :crypto.hash_init(:sha256)
-    |> :crypto.hash_update(@protocol_ping)
-    |> :crypto.hash_update(<<rooted_height::64-little>>)
-    |> :crypto.hash_update(<<rooted_slot::64-little>>)
-    |> :crypto.hash_update(<<temporal_height::64-little>>)
-    |> :crypto.hash_update(<<temporal_slot::64-little>>)
-    |> :crypto.hash_update(<<timestamp_ms::64-little>>)
-    |> :crypto.hash_final()
-    
+    # Build exact byte sequence to mirror Rust and allow debugging
+    bytes =
+      @protocol_ping <>
+      <<rooted_height::64-little>> <>
+      <<rooted_slot::64-little>> <>
+      <<temporal_height::64-little>> <>
+      <<temporal_slot::64-little>> <>
+      <<timestamp_ms::64-little>>
+
+    debug_enabled =
+      case System.get_env("AMA_ORACLE_DEBUG") do
+        v when is_binary(v) -> String.downcase(v) in ["1", "true", "yes"]
+        _ -> false
+      end
+
+    if debug_enabled do
+      IO.puts(:standard_error, "[ELIXIR] Ping hash input hex: #{Base.encode16(bytes, case: :lower)}")
+    end
+
+    digest = :crypto.hash(:sha256, bytes)
+
+    if debug_enabled do
+      IO.puts(:standard_error, "[ELIXIR] Ping digest hex: #{Base.encode16(digest, case: :lower)}")
+    end
+
     digest
   end
   
-  # Create canonical digest for TxPool message (matching Rust format)  
   defp create_txpool_canonical_digest(txs) do
-    # Create canonical representation: ("txpool", sorted_tx_hashes)
-    # Convert integer lists to binary data and sort for deterministic ordering (matching Rust)
-    binary_txs = Enum.map(txs, fn tx when is_list(tx) -> 
-      :binary.list_to_bin(tx)
-    end)
-    sorted_txs = Enum.sort(binary_txs)
-    
-    # Use incremental hashing exactly like Rust implementation
-    initial_hash = :crypto.hash_init(:sha256)
-    |> :crypto.hash_update(@protocol_txpool)
-    
-    final_hash = Enum.reduce(sorted_txs, initial_hash, fn tx, hash_state ->
-      :crypto.hash_update(hash_state, tx)
-    end)
-    
-    :crypto.hash_final(final_hash)
+    binary_txs =
+      Enum.map(txs, fn
+        tx when is_list(tx) -> :binary.list_to_bin(tx)
+        tx when is_binary(tx) -> tx
+        _ -> <<>>
+      end)
+
+    {valid_txs, filtered_count} =
+      Enum.reduce(binary_txs, {[], 0}, fn tx, {acc, bad} ->
+        is_valid =
+          try do
+            case TX.validate(tx, false) do
+              %{error: :ok} -> true
+              _ -> false
+            end
+          catch
+            _, _ -> false
+          rescue
+            _ -> false
+          end
+
+        if is_valid do
+          {[tx | acc], bad}
+        else
+          {acc, bad + 1}
+        end
+      end)
+
+    sorted_valid = Enum.sort(valid_txs)
+
+    initial_hash =
+      :crypto.hash_init(:sha256)
+      |> :crypto.hash_update(@protocol_txpool)
+
+    final_hash =
+      Enum.reduce(sorted_valid, initial_hash, fn tx, hash_state ->
+        :crypto.hash_update(hash_state, tx)
+      end)
+
+    digest = :crypto.hash_final(final_hash)
+    {digest, length(sorted_valid), filtered_count}
   end
   
-  # Create canonical digest for Peers message (matching Rust format)
   defp create_peers_canonical_digest(ips) do
-    # Create canonical representation: ("peers", sorted_ips)
-    # Use incremental hashing exactly like Rust implementation with explicit binary handling
     sorted_ips = Enum.sort(ips)
     
-    # Convert UTF-8 strings to pure binary data to match Rust's ip.as_bytes()
     binary_ips = Enum.map(sorted_ips, fn ip -> 
-      # Convert string to explicit byte list, then back to pure binary
       :binary.list_to_bin(:binary.bin_to_list(ip))
     end)
     
-    # Use incremental hashing like Rust - ensure all data is treated as explicit binary
     initial_hash = :crypto.hash_init(:sha256)
     |> :crypto.hash_update(@protocol_peers)
     
     final_hash = Enum.reduce(binary_ips, initial_hash, fn ip_binary, hash_state ->
-      :crypto.hash_update(hash_state, ip_binary)  # Pure binary, no UTF-8 metadata
+      :crypto.hash_update(hash_state, ip_binary)
     end)
     
     :crypto.hash_final(final_hash)
   end
   
-  # Create canonical digest for PeersV2 message (matching future Rust format)
   defp create_peers_v2_canonical_digest(anrs) do
-    # Create canonical representation: ("peers_v2", sorted_anrs)
-    # Use incremental hashing exactly like other operations
     sorted_anrs = Enum.sort(anrs)
     
-    # Convert ANRs to pure binary data to match expected Rust implementation
     binary_anrs = Enum.map(sorted_anrs, fn anr -> 
-      # Convert string to explicit byte list, then back to pure binary
       :binary.list_to_bin(:binary.bin_to_list(anr))
     end)
     
-    # Use incremental hashing like other operations
     initial_hash = :crypto.hash_init(:sha256)
     |> :crypto.hash_update(@protocol_peers_v2)
     
     final_hash = Enum.reduce(binary_anrs, initial_hash, fn anr_binary, hash_state ->
-      :crypto.hash_update(hash_state, anr_binary)  # Pure binary, no UTF-8 metadata
+      :crypto.hash_update(hash_state, anr_binary)
     end)
     
     :crypto.hash_final(final_hash)
   end
 
-  # Create a mock entry summary for testing
   defp create_mock_entry_summary(adapter, height, slot) do
-    # Create deterministic mock data
     prev_hash = deterministic_hash(adapter, height, slot, 0)
     dr = deterministic_hash(adapter, height, slot, 1) 
     txs_hash = deterministic_hash(adapter, height, slot, 2)
@@ -245,31 +262,27 @@ defmodule ElixirRunner.ProtocolAdapter do
       prev_hash: prev_hash,
       signer: adapter.mock_signer,
       dr: dr,
-      vr: :binary.copy(<<0x00>>, 96), # Mock VR
+      vr: :binary.copy(<<0x00>>, 96),
       txs_hash: txs_hash
     }
     
-    # Pack header
     header_packed = :erlang.term_to_binary(header, [:deterministic])
-    signature = :binary.copy(<<0x00>>, 96) # Mock signature
+    signature = :binary.copy(<<0x00>>, 96)
     
     %{
       header: header_packed,
       signature: signature,
-      mask: nil # No mask for single signer
+      mask: nil
     }
   end
 
-  # Generate deterministic hash based on inputs (using SHA256 for escript compatibility)
   defp deterministic_hash(adapter, height, slot, salt) do
     data = <<height::64, slot::64, salt, adapter.mock_signer::binary>>
     :crypto.hash(:sha256, data)
   end
 
-  # Test serialization for different message types
   defp test_ping_serialization(payload) do
     try do
-      # Try to decompress and parse as ping
       decompressed = NodeProto.deflate_decompress(payload)
       term = :erlang.binary_to_term(decompressed, [:safe])
       

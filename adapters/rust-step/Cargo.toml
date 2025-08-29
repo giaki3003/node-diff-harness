@@ -25,5 +25,9 @@ eetf = "0.10"
 rand = "0.8"
 rand_chacha = "0.3"
 
+# Debug-only hex printing used in runtime logs when FUZZ_DEBUG=1
+hex = "0.4"
+
 [dev-dependencies]
 tokio-test = "0.4"
+hex = "0.4"
