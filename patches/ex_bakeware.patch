@@ -13,8 +13,8 @@ index 09c2d00..d03bd14 100644
 +            oracle_mode = System.get_env("AMA_RESULT_FD") != nil
 +            
 +            if oracle_mode do
-+              IO.puts(:stderr, "[DEBUG] BAKEWARE.MAIN CALLED IN ORACLE MODE - SKIPPING Ama.start to prevent RocksDB conflicts")
-+              # In oracle mode, the ElixirRunner.CLI already handles initialization
++              # Only for oracle mode:
++              # ElixirRunner.CLI already handles initialization
 +              # Just wait indefinitely to avoid calling Ama.start which would create RocksDB lock conflicts
 +              # The actual oracle work is handled by ElixirRunner.CLI
 +              receive do end

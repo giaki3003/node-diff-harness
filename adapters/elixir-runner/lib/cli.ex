@@ -12,7 +12,7 @@ defmodule ElixirRunner.CLI do
     # CRITICAL: Force stdio to binary mode to prevent UTF-8 encoding corruption
     :io.setopts(:stdio, [:binary, {:encoding, :latin1}])
     
-    
+
     # Set up comprehensive error handling to prevent stdout corruption
     Process.flag(:trap_exit, true)
     
@@ -111,10 +111,9 @@ defmodule ElixirRunner.CLI do
       Process.register(original_stderr, :standard_io)
     end
     
-    IO.puts(:stderr, "Elixir oracle starting with stdout redirection...")
-    
-    # LAYER 4: Minimal bootstrapping - bypass ama application entirely
-    case minimal_init_executor() do
+    # LAYER 4: Use minimal initialization to avoid calling Ama.start/2 which unconditionally calls Fabric.init()
+    # This prevents RocksDB lock conflicts by using proper persistent term checks
+    case safe_init_executor_with_db() do
       {:ok, executor} ->
         # LAYER 3: Restore stdout for binary protocol after minimal startup
         if original_stdout && original_stderr do
@@ -122,7 +121,6 @@ defmodule ElixirRunner.CLI do
           Process.register(original_stdout, :standard_io)
         end
         
-        IO.puts(:stderr, "Oracle initialized with minimal bootstrapping - no ama app startup")
         oracle_loop_safe(executor, out_io)
       {:error, reason} ->
         IO.puts(:stderr, "Minimal initialization failed: #{reason}")
@@ -153,9 +151,14 @@ defmodule ElixirRunner.CLI do
   
   # LAYER 4: Setup minimal configuration ONLY - no application startup, no IO.puts
   defp setup_minimal_config_only do
-    # Set work_folder to a temporary location for oracle operation
-    work_folder = System.tmp_dir!() |> Path.join("oracle_workdir")
+    # Create unique database directory per oracle process to avoid RocksDB locking conflicts
+    unique_pid = System.get_pid()
+    random_suffix = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
+    unique_dirname = "oracle_workdir_#{unique_pid}_#{random_suffix}"
+    work_folder = System.tmp_dir!() |> Path.join(unique_dirname)
     File.mkdir_p!(work_folder)
+    
+    # Note: Database initialization now happens in init_ama_with_db() for full fuzzing support
     
     # ESSENTIAL configurations from config/config.exs that trace processing requires
     Application.put_env(:ama, :work_folder, work_folder)
@@ -179,7 +182,205 @@ defmodule ElixirRunner.CLI do
     Application.put_env(:ama, :udp_ipv4_tuple, {0,0,0,0})  # Disable UDP
     Application.put_env(:ama, :udp_port, 0)            # Disable UDP
     
+    # CRITICAL: Set offline mode to prevent network operations and reduce initialization
+    Application.put_env(:ama, :offline, true)
+    Application.put_env(:ama, :autoupdate, false)
+    
     # NOTE: NO Application.ensure_all_started(:ama) - this prevents IO.puts pollution!
+  end
+  
+  # Initialize ama application with database for full fuzzing support
+  defp init_ama_with_db do
+    try do
+      # CRITICAL: Set up ama configuration BEFORE starting the application
+      setup_minimal_config_only()
+      
+      # CRITICAL: Explicitly start RocksDB application to ensure NIF is loaded
+      case Application.ensure_all_started(:rocksdb) do
+        {:ok, _apps} ->
+          :ok
+        {:error, _reason} ->
+          :ok
+      end
+      
+      # Start the ama application - this will initialize rocksdb
+      case Application.ensure_all_started(:ama) do
+        {:ok, _apps} ->
+          # CRITICAL: Initialize Fabric once at startup (not per-trace)
+          ensure_fabric_started!()
+          
+          # CRITICAL: Pre-initialize all lazy-loaded components to prevent secondary startup
+          pre_initialize_components()
+          
+          # Now initialize the trace executor
+          case ElixirRunner.TraceExecutor.init() do
+            {:ok, executor} -> 
+              {:ok, executor}
+            {:error, reason} -> 
+              {:error, "trace_executor_init_failed: #{reason}"}
+          end
+          
+        {:error, reason} ->
+          {:error, "ama_app_start_failed: #{inspect(reason)}"}
+      end
+    rescue
+      e -> 
+        {:error, "ama_init_exception: #{Exception.message(e)}"}
+    end
+  end
+  
+  # Safe initialization with database support but without full application startup
+  defp safe_init_executor_with_db do
+    try do
+      
+      # CRITICAL: Set up ama configuration BEFORE any database operations
+      setup_minimal_config_only()
+      
+      # CRITICAL: Explicitly start RocksDB application to ensure NIF is loaded
+      case Application.ensure_all_started(:rocksdb) do
+        {:ok, _apps} ->
+          :ok
+        {:error, reason} ->
+          :ok
+      end
+      
+      # CRITICAL: Initialize Fabric once at startup using persistent term checks
+      # This avoids calling Ama.start/2 which unconditionally calls Fabric.init()
+      ensure_fabric_started!()
+      
+      # Initialize TXPool manually (normally done in Ama.start/2)
+      TXPool.init()
+      
+      # Initialize required ETS tables (normally done in Ama.start/2)
+      initialize_essential_ets_tables()
+      
+      # Pre-initialize all lazy-loaded components
+      pre_initialize_components()
+      
+      # Now initialize the trace executor
+      case ElixirRunner.TraceExecutor.init() do
+        {:ok, executor} -> 
+          {:ok, executor}
+        {:error, reason} -> 
+          {:error, "trace_executor_init_failed: #{reason}"}
+      end
+      
+    rescue
+      e -> 
+        {:error, "safe_db_init_exception: #{Exception.message(e)}"}
+    end
+  end
+
+  # Initialize essential ETS tables without starting full application
+  defp initialize_essential_ets_tables do
+    
+    # These are normally created in Ama.start/2 but we need them for TX validation
+    tables_to_create = [
+      {NODEPeers, [:ordered_set, :named_table, :public, {:write_concurrency, true}, {:read_concurrency, true}, {:decentralized_counters, false}]},
+      {SOLVerifyCache, [:ordered_set, :named_table, :public, {:write_concurrency, true}, {:read_concurrency, true}, {:decentralized_counters, false}]},
+      {AttestationCache, [:ordered_set, :named_table, :public, {:write_concurrency, true}, {:read_concurrency, true}, {:decentralized_counters, false}]}
+    ]
+    
+    Enum.each(tables_to_create, fn {table_name, options} ->
+      case :ets.info(table_name) do
+        :undefined ->
+          :ets.new(table_name, options)
+        _ ->
+          :ok
+      end
+    end)
+  end
+
+  # Pre-initialize all lazy-loaded components to prevent secondary ama spawning
+  defp pre_initialize_components do
+    
+    try do
+      # CRITICAL: Ensure RocksDB NIF is loaded first
+      case Code.ensure_loaded?(:rocksdb) do
+        true ->
+          :ok
+        false ->
+          # Try to manually load the NIF - this might work in escript context
+          try do
+            # Force load the rocksdb application's code
+            case Application.load(:rocksdb) do
+              :ok ->
+                # Try to ensure loaded again after application load
+                Code.ensure_loaded?(:rocksdb)
+              {:error, {:already_loaded, :rocksdb}} ->
+                :ok
+              error ->
+                :ok
+            end
+          rescue
+            e -> :ok
+          end
+      end
+      
+      # NOTE: Fabric initialization now happens once at startup via ensure_fabric_started!()
+      # This function now only handles other component pre-loading
+      
+      
+      # Pre-initialize any other components that might be lazy loaded
+      # EntryGenesis should be available after ama application starts
+      if Code.ensure_loaded?(EntryGenesis) do
+        try do
+          EntryGenesis.get()
+        rescue
+          _ -> :ok
+        end
+      end
+      
+      # Pre-initialize Consensus module if available
+      if Code.ensure_loaded?(Consensus) do
+        try do
+          # Try to access chain_height to force initialization
+          Consensus.chain_height()
+        rescue
+          _ -> :ok
+        end
+      end
+      
+      :ok
+    rescue
+      e ->
+        # Don't fail the entire startup for pre-initialization issues
+        :ok
+    end
+  end
+  
+  # Proper atomic Fabric initialization using :global.trans for true serialization
+  defp ensure_fabric_started! do
+    workdir = Application.get_env(:ama, :work_folder)
+    
+    :ok = :global.trans({:fabric_init, workdir}, fn ->
+      case :persistent_term.get({:fabric, workdir}, :not_found) do
+        :ok ->
+          :ok
+        :not_found ->
+          
+          # Ensure database directory exists
+          db_path = Path.join(workdir, "db")
+          File.mkdir_p!(db_path)
+          
+          # Run the real init ONCE with proper error handling
+          try do
+            case Fabric.init() do
+              :ok ->
+                # CRITICAL: Mark as initialized AFTER success
+                :persistent_term.put({:fabric, workdir}, :ok)
+                :ok
+              other ->
+                other
+            end
+          rescue
+            error ->
+              error_msg = Exception.message(error)
+              reraise error, __STACKTRACE__
+          end
+      end
+    end, [node()], 60_000)
+    
   end
   
   # Safe initialization that tries to avoid full application startup
@@ -643,8 +844,10 @@ defmodule ElixirRunner.CLI do
           case TraceExecutor.execute(executor, trace) do
             {:ok, result} ->
               case safe_serialize_result(result) do
-                {:ok, result_binary} -> {:ok, result_binary}
-                {:error, reason} -> {:error, "serialization_failed: #{reason}"}
+                {:ok, result_binary} -> 
+                  {:ok, result_binary}
+                {:error, reason} -> 
+                  {:error, "serialization_failed: #{reason}"}
               end
             {:error, reason} ->
               {:error, "execution_failed: #{reason}"}

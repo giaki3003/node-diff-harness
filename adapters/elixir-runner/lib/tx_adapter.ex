@@ -34,8 +34,6 @@ defmodule ElixirRunner.TxAdapter do
   """
   def validate_transaction(_adapter, %{tx_data: tx_data, is_special_meeting: is_special_meeting}) do
     try do
-      # DEBUG: Log the environment to verify config is loaded
-      IO.puts(:stderr, "[DEBUG] TX validation starting, tx_size config: #{inspect(Application.get_env(:ama, :tx_size))}")
       
       # Convert list of bytes to binary if needed
       tx_binary =
@@ -56,9 +54,7 @@ defmodule ElixirRunner.TxAdapter do
 
         true ->
           # Direct validation - let TX.validate handle all edge cases
-          IO.puts(:stderr, "[DEBUG] Calling TX.validate with #{byte_size(tx_binary)} bytes")
           result = TX.validate(tx_binary, is_special_meeting)
-          IO.puts(:stderr, "[DEBUG] TX.validate returned: #{inspect(result)}")
 
           validation_code =
             case result do
@@ -76,7 +72,6 @@ defmodule ElixirRunner.TxAdapter do
     rescue
       # Any decode exception → canonical decode error for consistent differential testing
       e ->
-        IO.puts(:stderr, "[DEBUG] TX validation rescue: #{inspect(e)}")
         tx_size = case tx_data do
           data when is_binary(data) -> byte_size(data)
           data when is_list(data) -> length(data)
@@ -90,7 +85,6 @@ defmodule ElixirRunner.TxAdapter do
          }}
     catch
       :throw, %{error: error} ->
-        IO.puts(:stderr, "[DEBUG] TX validation caught throw: #{inspect(error)}")
         validation_code = map_error_to_code(error)
         tx_size = case tx_data do
           data when is_binary(data) -> byte_size(data)
