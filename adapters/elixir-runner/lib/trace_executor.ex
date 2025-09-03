@@ -73,7 +73,23 @@ defmodule ElixirRunner.TraceExecutor do
   end
 
   defp execute_operations(executor, [], results) do
-    digest = Normalizer.compute_digest(executor.normalizer, results)
+    # Reverse results to maintain chronological order (results were prepended during accumulation)
+    reversed_results = Enum.reverse(results)
+    
+    debug_enabled = case System.get_env("AMA_ORACLE_DEBUG") do
+      v when is_binary(v) -> String.downcase(v) in ["1", "true", "yes"]
+      _ -> false
+    end
+    
+    if debug_enabled do
+      File.write("/tmp/elixir_protocol_debug.log", "[ELIXIR PROTOCOL] Final operations for digest:\n", [:append])
+      Enum.with_index(reversed_results, fn result, index ->
+        File.write("/tmp/elixir_protocol_debug.log", "[ELIXIR PROTOCOL] Op #{index}: #{inspect(result)}\n", [:append])
+      end)
+      File.write("/tmp/elixir_protocol_debug.log", "[ELIXIR PROTOCOL] Total operations: #{length(results)}\n", [:append])
+    end
+    
+    digest = Normalizer.compute_digest(executor.normalizer, reversed_results)
     
     {:ok, %{
       digest: digest,
@@ -89,15 +105,27 @@ defmodule ElixirRunner.TraceExecutor do
   end
 
   defp execute_operations(executor, [op | remaining_ops], results) do
+    debug_enabled = case System.get_env("AMA_ORACLE_DEBUG") do
+      v when is_binary(v) -> String.downcase(v) in ["1", "true", "yes"]
+      _ -> false
+    end
+    
     case execute_single_operation(executor, op) do
       {:ok, %{type: :noop}} ->
+        if debug_enabled do
+          File.write("/tmp/elixir_protocol_debug.log", "[ELIXIR PROTOCOL] Skipping noop operation: #{inspect(op)}\n", [:append])
+        end
         execute_operations(executor, remaining_ops, results)
 
       {:ok, result} ->
+        if debug_enabled do
+          File.write("/tmp/elixir_protocol_debug.log", "[ELIXIR PROTOCOL] Adding operation to results: #{inspect(op)} -> #{inspect(result)}\n", [:append])
+        end
         execute_operations(executor, remaining_ops, [result | results])
 
       {:error, reason} ->
-        digest = Normalizer.compute_digest(executor.normalizer, results)
+        # Reverse results to maintain chronological order (results were prepended during accumulation)
+        digest = Normalizer.compute_digest(executor.normalizer, Enum.reverse(results))
 
         {:ok,
          %{

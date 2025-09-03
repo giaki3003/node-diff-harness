@@ -26,6 +26,9 @@ defmodule ElixirRunner.MixProject do
       # JSON for trace parsing
       {:jason, "~> 1.4"},
       
+      # VanillaSer validation NIF for consistency with Rust implementation
+      {:rustler, "~> 0.36.2"},
+      
       # Note: ETF serialization uses built-in :erlang.term_to_binary
       # Note: Using SHA256 for deterministic hashing (built-in :crypto module)
       

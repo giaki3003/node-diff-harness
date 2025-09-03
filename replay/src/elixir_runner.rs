@@ -170,10 +170,10 @@ impl ElixirRunner {
         for dir in &possible_dirs {
             let mut cmd = Command::new("mix");
             unsafe {
-                cmd.args(&["run", "--no-halt", "-e", "ElixirRunner.CLI.main([])"])
+                cmd.args(&["run", "--no-compile", "--no-halt", "-e", "ElixirRunner.CLI.main([])"])
                     .current_dir(dir)
                     .env("AMA_RESULT_FD", "3")
-                    .env("MIX_ENV", "dev")  // Use dev mode for full NIF availability
+                    .env("MIX_ENV", "prod")  // Use prod to load precompiled NIFs consistently
                     .stdin(Stdio::piped())
                     .stdout(Stdio::null())   // logs won't matter now
                     .stderr(Stdio::inherit())   // Enable to see mix output for debugging

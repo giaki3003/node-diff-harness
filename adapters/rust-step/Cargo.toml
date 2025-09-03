@@ -27,6 +27,7 @@ rand_chacha = "0.3"
 
 # Debug-only hex printing used in runtime logs when FUZZ_DEBUG=1
 hex = "0.4"
+miniz_oxide = "0.8.9"
 
 [dev-dependencies]
 tokio-test = "0.4"

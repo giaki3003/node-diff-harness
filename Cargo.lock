@@ -2170,6 +2170,7 @@ dependencies = [
  "anyhow",
  "eetf",
  "hex",
+ "miniz_oxide",
  "proto",
  "rand",
  "rand_chacha",

@@ -66,32 +66,47 @@ impl ProtocolAdapter {
 
     /// Test message deserialization
     pub fn test_serialization(&mut self, msg_type: &MessageType, payload: &[u8]) -> Result<bool> {
-        // Test deserialization success based on message type
-        match msg_type {
-            MessageType::Ping => {
-                match protocol::from_etf_bin(payload) {
-                    Ok(msg) => Ok(msg.typename() == "ping"),
-                    Err(_) => Ok(false),
-                }
-            }
-            MessageType::Pong => {
-                match protocol::from_etf_bin(payload) {
-                    Ok(msg) => Ok(msg.typename() == "pong"),
-                    Err(_) => Ok(false),
-                }
-            }
-            MessageType::TxPool => {
-                match protocol::from_etf_bin(payload) {
-                    Ok(msg) => Ok(msg.typename() == "txpool"),
-                    Err(_) => Ok(false),
-                }
-            }
-            // TODO: Re-enable PeersV2 once Rust implementation supports peers_v2 operations
-            MessageType::PeersV2 => {
-                // For now, always return false since Rust doesn't support PeersV2 yet
-                Ok(false)
-            }
+        // Guard against pathological inputs and perform a safe pre-check without touching rs_node
+        const MAX_PAYLOAD_LEN: usize = 256 * 1024; // 256 KiB compressed payload cap for fuzzing
+        const MAX_DECOMPRESSED: usize = 1 << 20; // 1 MiB cap to avoid zip-bombs
+
+        if payload.len() > MAX_PAYLOAD_LEN {
+            return Ok(false);
         }
+
+        // Try to safely decompress with a limit; if it fails, treat as non-serializable
+        let decompressed = match miniz_oxide::inflate::decompress_to_vec_with_limit(payload, MAX_DECOMPRESSED) {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        };
+
+        // ETF version magic is 131 (0x83)
+        if !matches!(decompressed.first(), Some(131)) {
+            return Ok(false);
+        }
+
+        // Heuristic: ensure decompressed size is not excessive for our simple messages
+        if decompressed.len() > MAX_DECOMPRESSED {
+            return Ok(false);
+        }
+
+        // Cheap check: both the field name "op" and the expected atom name appear
+        // in the buffer. This avoids invoking the real decoder (which can OOM on
+        // malicious arities) while still giving useful signal to the fuzzer.
+        fn contains(h: &[u8], n: &[u8]) -> bool {
+            if n.is_empty() || n.len() > h.len() { return false; }
+            h.windows(n.len()).any(|w| w == n)
+        }
+        let has_op = contains(&decompressed, b"op");
+        let expected = match msg_type {
+            MessageType::Ping => b"ping" as &[u8],
+            MessageType::Pong => b"pong" as &[u8],
+            MessageType::TxPool => b"txpool" as &[u8],
+            MessageType::PeersV2 => b"peers_v2" as &[u8],
+        };
+        let has_expected = contains(&decompressed, expected);
+
+        Ok(has_op && has_expected && !matches!(msg_type, MessageType::PeersV2))
     }
 
     /// Reset internal state

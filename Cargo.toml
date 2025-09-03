@@ -12,6 +12,7 @@ exclude = [
     "node",     # git submodule
     "adapters/elixir-runner/deps/blake3/native/blake3",  # Elixir dependency
     "adapters/elixir-runner/deps/bls_ex/native/bls",     # Elixir dependency
+    "adapters/elixir-runner/native/vanilla_validator_nif",  # Elixir NIF
 ]
 
 [workspace.dependencies]

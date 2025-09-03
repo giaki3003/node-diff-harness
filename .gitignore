@@ -4,3 +4,5 @@ elixir_runner
 target
 fuzz_protocol
 .repo-to-text-settings.yaml
+
+adapters/elixir-runner/priv/native/libvanilla_validator_nif.so

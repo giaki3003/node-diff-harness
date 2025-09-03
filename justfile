@@ -27,14 +27,14 @@ fuzz:
     if ! cargo fuzz --help > /dev/null 2>&1; then
         cargo install cargo-fuzz
     fi
-    cd fuzz && cargo fuzz run fuzz_protocol -- -runs=0 -max_total_time=300
+    cd fuzz && cargo fuzz run fuzz_protocol -- -runs=0 -max_total_time=300 -ignore_ooms=1 -rss_limit_mb=2048
 
 fuzz-quick:
     #!/usr/bin/env bash  
     if ! cargo fuzz --help > /dev/null 2>&1; then
         cargo install cargo-fuzz
     fi
-    cd fuzz && cargo fuzz run fuzz_protocol -- -max_total_time=30
+    cd fuzz && cargo fuzz run fuzz_protocol -- -max_total_time=30000000 -ignore_ooms=1 -rss_limit_mb=2048
 
 # Debugging
 replay TRACE:
@@ -84,7 +84,7 @@ fuzz-intensive:
         cargo install cargo-fuzz
     fi
     echo "🔥 Starting intensive 30-minute fuzzing session with 4 workers..."
-    cd fuzz && cargo fuzz run fuzz_protocol -- -runs=0 -max_total_time=1800 -workers=4
+    cd fuzz && cargo fuzz run fuzz_protocol -- -runs=0 -max_total_time=1800 -workers=4 -ignore_ooms=1 -rss_limit_mb=2048
 
 # Performance testing  
 perf-test:

@@ -5,6 +5,7 @@ defmodule ElixirRunner.ProtocolAdapter do
   This module interfaces with the actual NodeProto module from the 
   Elixir node to create and process protocol messages.
   """
+  import Bitwise
 
   @protocol_ping <<112, 105, 110, 103>>
   @protocol_txpool <<116, 120, 112, 111, 111, 108>>
@@ -184,14 +185,15 @@ defmodule ElixirRunner.ProtocolAdapter do
       Enum.reduce(binary_txs, {[], 0}, fn tx, {acc, bad} ->
         is_valid =
           try do
-            case TX.validate(tx, false) do
+            # Use the same validation logic as TxAdapter for consistency
+            case validate_transaction_with_expansion_check(tx, false) do
               %{error: :ok} -> true
               _ -> false
             end
-          catch
-            _, _ -> false
           rescue
             _ -> false
+          catch
+            _, _ -> false
           end
 
         if is_valid do
@@ -335,5 +337,126 @@ defmodule ElixirRunner.ProtocolAdapter do
     rescue
       _ -> false  
     end
+  end
+
+  # Transaction validation with expansion bomb detection
+  # This mirrors the logic from TxAdapter to ensure consistent validation
+  defp validate_transaction_with_expansion_check(tx_binary, is_special_meeting) do
+    debug_enabled =
+      case System.get_env("AMA_ORACLE_DEBUG") do
+        v when is_binary(v) -> String.downcase(v) in ["1", "true", "yes"]
+        _ -> false
+      end
+
+    # Write debug to file to ensure it's working
+    if debug_enabled do
+      File.write("/tmp/elixir_protocol_debug.log", "[ELIXIR PROTOCOL] validate_transaction called with #{byte_size(tx_binary)} bytes\n", [:append])
+      File.write("/tmp/elixir_protocol_debug.log", "[ELIXIR PROTOCOL] First 20 bytes: #{inspect(binary_part(tx_binary, 0, min(20, byte_size(tx_binary))))}\n", [:append])
+      IO.puts(:standard_error, "[ELIXIR PROTOCOL] validate_transaction called with #{byte_size(tx_binary)} bytes")
+      IO.puts(:standard_error, "[ELIXIR PROTOCOL] First 20 bytes: #{inspect(binary_part(tx_binary, 0, min(20, byte_size(tx_binary))))}")
+    end
+
+    max_tx_size = Application.get_env(:ama, :tx_size, 393_216)
+
+    cond do
+      byte_size(tx_binary) > max_tx_size ->
+        if debug_enabled do
+          IO.puts(:standard_error, "[ELIXIR PROTOCOL] Transaction too large: #{byte_size(tx_binary)} > #{max_tx_size}")
+        end
+        %{error: :too_large}
+
+      detect_expansion_bombs(tx_binary) ->
+        if debug_enabled do
+          IO.puts(:standard_error, "[ELIXIR PROTOCOL] Expansion bomb pattern detected")
+        end
+        %{error: :too_large}
+
+      true ->
+        # Continue to normal validation
+        if debug_enabled do
+          IO.puts(:standard_error, "[ELIXIR PROTOCOL] Calling TX.validate")
+        end
+        result = TX.validate(tx_binary, is_special_meeting)
+        if debug_enabled do
+          IO.puts(:standard_error, "[ELIXIR PROTOCOL] TX.validate result: #{inspect(result)}")
+        end
+        result
+    end
+  end
+
+  # Detect patterns that could cause exponential memory expansion
+  # This matches the logic from TxAdapter
+  defp detect_expansion_bombs(data) when byte_size(data) == 0, do: false
+  defp detect_expansion_bombs(data) do
+    scan_limit = min(byte_size(data), 200)
+    scan_data = binary_part(data, 0, scan_limit)
+    
+    {collection_count, suspicious_varints} = scan_for_patterns(scan_data, 0, 0, 0)
+    
+    debug_enabled =
+      case System.get_env("AMA_ORACLE_DEBUG") do
+        v when is_binary(v) -> String.downcase(v) in ["1", "true", "yes"]
+        _ -> false
+      end
+
+    if debug_enabled do
+      IO.puts(:standard_error, "[ELIXIR PROTOCOL] Expansion bomb scan: collections=#{collection_count}, suspicious_varints=#{suspicious_varints}, scan_limit=#{scan_limit}")
+    end
+    
+    # Heuristic thresholds based on expansion potential
+    density_ratio = collection_count / scan_limit
+    
+    result = collection_count > 50                                     # Too many collections
+      or suspicious_varints > 10                             # Too many large varints  
+      or density_ratio > 0.3                                 # Too dense with collections
+      or (collection_count > 20 and suspicious_varints > 2)  # Combined risk
+      
+    if debug_enabled do
+      IO.puts(:standard_error, "[ELIXIR PROTOCOL] Expansion bomb result: #{result}, density_ratio=#{density_ratio}")
+    end
+    result
+  end
+  
+  # Scan binary data for suspicious patterns that could cause expansion bombs
+  defp scan_for_patterns(<<>>, _pos, collection_count, suspicious_varints) do
+    {collection_count, suspicious_varints}
+  end
+  
+  defp scan_for_patterns(<<tag::8, rest::binary>>, pos, collection_count, suspicious_varints) when tag in [5, 6, 7] do
+    # Bytes, List, Map tags - check length encoding that follows
+    new_collection_count = collection_count + 1
+    
+    case rest do
+      <<length_byte::8, remaining::binary>> ->
+        magnitude = length_byte &&& 0x7F
+        
+        new_suspicious = if magnitude > 4 do
+          suspicious_varints + 1
+        else
+          suspicious_varints
+        end
+        
+        # Early termination for clearly pathological cases
+        if new_collection_count > 30 or new_suspicious > 5 do
+          # Signal expansion bomb detected via special return value
+          {999, 999} # This will trigger the heuristic check
+        else
+          # Skip ahead by magnitude length to avoid false positives
+          skip_bytes = min(magnitude, byte_size(remaining))
+          case remaining do
+            <<_skip::binary-size(skip_bytes), next_data::binary>> ->
+              scan_for_patterns(next_data, pos + 2 + skip_bytes, new_collection_count, new_suspicious)
+            _ ->
+              {new_collection_count, new_suspicious}
+          end
+        end
+        
+      _ ->
+        {new_collection_count, suspicious_varints}
+    end
+  end
+  
+  defp scan_for_patterns(<<_::8, rest::binary>>, pos, collection_count, suspicious_varints) do
+    scan_for_patterns(rest, pos + 1, collection_count, suspicious_varints)
   end
 end

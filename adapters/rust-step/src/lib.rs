@@ -13,6 +13,7 @@ use std::time::Instant;
 pub mod normalizer;
 pub mod protocol_adapter;
 pub mod tx_adapter;
+pub mod vanilla_validator;
 
 use normalizer::Normalizer;
 use protocol_adapter::ProtocolAdapter;
@@ -124,7 +125,7 @@ impl RustStepExecutor {
     /// Compute normalized digest from operation results
     fn compute_digest(&self, results: &[OperationResult]) -> Vec<u8> {
         // Build the exact byte stream we will hash so we can debug it if needed
-        let debug_enabled = std::env::var("FUZZ_DEBUG")
+        let debug_enabled = std::env::var("AMA_ORACLE_DEBUG")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
@@ -156,6 +157,7 @@ impl RustStepExecutor {
 
         if debug_enabled {
             eprintln!("[RUST] Trace digest input bytes: {:?}", &input_bytes);
+            eprintln!("[RUST] Trace digest input hex: {}", hex::encode(&input_bytes));
         }
 
         let mut hasher = Sha256::new();
@@ -163,7 +165,7 @@ impl RustStepExecutor {
         let digest = hasher.finalize().to_vec();
 
         if debug_enabled {
-            eprintln!("[RUST] Final trace digest bytes: {:?}", &digest);
+            eprintln!("[RUST] Final trace digest hex: {}", hex::encode(&digest));
         }
 
         digest

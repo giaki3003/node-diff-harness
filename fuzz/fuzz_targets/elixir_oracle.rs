@@ -71,6 +71,30 @@ impl ElixirOracle {
         
         // Serialize trace to JSON (simple format for now)
         let trace_json = serde_json::to_vec(trace).context("Failed to serialize trace")?;
+        
+        // Debug logging for differential debugging
+        if std::env::var("AMA_ORACLE_DEBUG").is_ok() {
+            eprintln!("[RUST] Serialized trace to JSON: {} bytes", trace_json.len());
+            if let Ok(trace_str) = std::str::from_utf8(&trace_json) {
+                let preview_len = std::cmp::min(trace_str.len(), 500);
+                eprintln!("[RUST] JSON preview (first {} chars): {}", preview_len, &trace_str[0..preview_len]);
+            }
+            // Log transaction details
+            for (i, op) in trace.ops.iter().enumerate() {
+                match op {
+                    proto::trace::Operation::TxPool { txs } => {
+                        eprintln!("[RUST] Op {}: TxPool with {} transactions", i, txs.len());
+                        for (j, tx) in txs.iter().enumerate() {
+                            eprintln!("[RUST] Tx {}: {} bytes, first 20: {:?}", j, tx.len(), 
+                                &tx[0..std::cmp::min(20, tx.len())]);
+                        }
+                    }
+                    _ => {
+                        eprintln!("[RUST] Op {}: {:?}", i, op);
+                    }
+                }
+            }
+        }
 
         // Send length-prefixed trace
         let length = trace_json.len() as u32;
@@ -233,14 +257,16 @@ impl ElixirOracle {
 
         let mut last_error = None;
 
-        // Strategy A: spawn ElixirRunner via mix run (enabled by default; set AMA_ORACLE_USE_MIX=0 to disable)
-        let use_mix = std::env::var("AMA_ORACLE_USE_MIX").map(|v| v != "0").unwrap_or(true);  // Enable mix for full NIF support
+        // Strategy A: spawn ElixirRunner via mix run (default). Set AMA_ORACLE_USE_MIX=0 to disable.
+        // We pass --no-deps-check and --no-compile to avoid compiling deps (e.g., reedsolomon_ex) during fuzzing.
+        let use_mix = std::env::var("AMA_ORACLE_USE_MIX").map(|v| v != "0").unwrap_or(true);
         if use_mix {
             let mut cmd = Command::new("mix");
             unsafe {
-                cmd.args(&["run", "--no-halt", "-e", "ElixirRunner.CLI.main([])"])
+                cmd.args(&["run", "--no-deps-check", "--no-compile", "--no-halt", "-e", "ElixirRunner.CLI.main([])"])
                     .current_dir("../adapters/elixir-runner")
-                    .env("MIX_ENV", "dev")  // Use dev mode for full NIF availability
+                    .env("MIX_ENV", "prod")  // Use prod mode to use precompiled deps/NIFs
+                    .env("HEX_OFFLINE", "1") // Prevent network fetches during fuzzing
                     .env("AMA_RESULT_FD", "3")
                     .stdin(Stdio::piped())
                     .stdout(Stdio::null())
@@ -295,7 +321,7 @@ impl ElixirOracle {
             }
         }
 
-        // Strategy B: Try to find and spawn the prebuilt Elixir runner escript
+        // Strategy B: Try to find and spawn the prebuilt Elixir runner escript (fallback)
         let escript_paths = [
             "../adapters/elixir-runner/elixir_runner",
             "./adapters/elixir-runner/elixir_runner",

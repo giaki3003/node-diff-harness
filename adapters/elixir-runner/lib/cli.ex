@@ -359,24 +359,36 @@ defmodule ElixirRunner.CLI do
           :ok
         :not_found ->
           
-          # Ensure database directory exists
-          db_path = Path.join(workdir, "db")
-          File.mkdir_p!(db_path)
-          
-          # Run the real init ONCE with proper error handling
-          try do
-            case Fabric.init() do
-              :ok ->
-                # CRITICAL: Mark as initialized AFTER success
-                :persistent_term.put({:fabric, workdir}, :ok)
-                :ok
-              other ->
-                other
+          # Check if we're in fuzzing mode (escript environment without NIFs)
+          if fuzzing_mode?() do
+            # Skip real database initialization for fuzzing
+            # Set up minimal persistent term to satisfy dependencies
+            :persistent_term.put({:rocksdb, Fabric}, %{
+              db: :mock_db,
+              cf: :mock_cf
+            })
+            :persistent_term.put({:fabric, workdir}, :ok)
+            :ok
+          else
+            # Ensure database directory exists
+            db_path = Path.join(workdir, "db")
+            File.mkdir_p!(db_path)
+            
+            # Run the real init ONCE with proper error handling
+            try do
+              case Fabric.init() do
+                :ok ->
+                  # CRITICAL: Mark as initialized AFTER success
+                  :persistent_term.put({:fabric, workdir}, :ok)
+                  :ok
+                other ->
+                  other
+              end
+            rescue
+              error ->
+                error_msg = Exception.message(error)
+                reraise error, __STACKTRACE__
             end
-          rescue
-            error ->
-              error_msg = Exception.message(error)
-              reraise error, __STACKTRACE__
           end
       end
     end, [node()], 60_000)
@@ -837,8 +849,51 @@ defmodule ElixirRunner.CLI do
   end
   
   defp execute_trace_with_timeout(executor, trace_binary) do
+    debug_enabled = 
+      case System.get_env("AMA_ORACLE_DEBUG") do
+        v when is_binary(v) -> String.downcase(v) in ["1", "true", "yes"]
+        _ -> false
+      end
+
+    if debug_enabled do
+      IO.puts(:standard_error, "[ELIXIR] Received trace binary of #{byte_size(trace_binary)} bytes")
+      trace_preview = binary_part(trace_binary, 0, min(200, byte_size(trace_binary)))
+      IO.puts(:standard_error, "[ELIXIR] Trace preview: #{inspect(trace_preview, limit: :infinity)}")
+    end
+
     case TraceParser.parse(trace_binary) do
       {:ok, trace} ->
+        if debug_enabled do
+          IO.puts(:standard_error, "[ELIXIR] Parsed trace: seed=#{trace.seed}, ops=#{length(trace.ops)}")
+          Enum.with_index(trace.ops) |> Enum.each(fn {op, i} ->
+            case op do
+              %{type: :txpool, txs: txs} ->
+                IO.puts(:standard_error, "[ELIXIR] Op #{i}: TxPool with #{length(txs)} transactions")
+                Enum.with_index(txs) |> Enum.each(fn {tx, j} ->
+                  tx_binary = cond do
+                    is_list(tx) -> 
+                      if debug_enabled do
+                        IO.puts(:standard_error, "[ELIXIR] Converting tx #{j} from list of #{length(tx)} integers to binary")
+                      end
+                      :binary.list_to_bin(tx)
+                    is_binary(tx) -> tx
+                    true -> <<>>
+                  end
+                  tx_size = byte_size(tx_binary)
+                  preview_size = min(20, tx_size)
+                  if tx_size > 0 do
+                    tx_preview = binary_part(tx_binary, 0, preview_size)
+                    IO.puts(:standard_error, "[ELIXIR] Tx #{j}: #{tx_size} bytes, first #{preview_size}: #{inspect(tx_preview)}")
+                  else
+                    IO.puts(:standard_error, "[ELIXIR] Tx #{j}: 0 bytes (empty)")
+                  end
+                end)
+              %{type: type} ->
+                IO.puts(:standard_error, "[ELIXIR] Op #{i}: #{type}")
+            end
+          end)
+        end
+        
         # CRITICAL: Protect stdout from any application pollution
         result = with_protected_stdout(fn ->
           case TraceExecutor.execute(executor, trace) do
@@ -921,5 +976,16 @@ defmodule ElixirRunner.CLI do
       {:error, reason} ->
         {:error, "init_failed: #{reason}"}
     end
+  end
+  
+  # Detect if we're running in fuzzing mode (escript without NIFs)
+  defp fuzzing_mode? do
+    # Multiple indicators that we're in fuzzing/escript mode:
+    # 1. AMA_FUZZ_MODE environment variable (explicit)
+    # 2. Missing rocksdb module (NIF not available)  
+    # 3. Running as escript (no Mix project)
+    System.get_env("AMA_FUZZ_MODE") == "1" ||
+      not Code.ensure_loaded?(:rocksdb) ||
+      is_nil(Mix.Project.get())
   end
 end
